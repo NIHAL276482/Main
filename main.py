@@ -155,9 +155,7 @@ def get_yt_dlp_metadata(url):
                     raise HTTPException(403, "Authentication required. Update cookies.txt.")
                 if attempt == 2:
                     return {"title": "Unknown Title", "thumbnail": None}
-                time
-
-.sleep(2 ** (attempt + 1))
+                time.sleep(2 ** (attempt + 1))
                 continue
             data = json.loads(process.stdout)
             title = data.get("title", "Unknown Title")
@@ -165,7 +163,10 @@ def get_yt_dlp_metadata(url):
             return {"title": title, "thumbnail": thumbnail}
         except Exception as e:
             logger.error(f"Metadata error: {str(e)}")
-            return {"title": "Unknown Title", "thumbnail": None}
+            if attempt == 2:
+                return {"title": "Unknown Title", "thumbnail": None}
+            time.sleep(2 ** (attempt + 1))
+    return {"title": "Unknown Title", "thumbnail": None}
 
 # File download utility
 async def download_file(url, path):
