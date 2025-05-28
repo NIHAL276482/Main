@@ -457,7 +457,7 @@ async def handle_terabox(url: str, request: Request, is_authenticated: bool):
 # Spotify handler
 @cached(ttl=300, cache=Cache.MEMORY)
 async def handle_spotify(url: str, request: Request, is_authenticated: bool):
-    api_url = f"http://127.0.0.1:3000/?url={url}"
+    api_url = f"http://sp.hosters.club/?url={url}"
     max_retries = 3
     retry_status_codes = [400, 404, 429, 500, 502, 503, 504]
     for attempt in range(max_retries):
