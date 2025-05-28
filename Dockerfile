@@ -19,7 +19,7 @@ COPY cookies.txt .
 COPY . .
 
 # Create downloads directory
-RUN mkdir -p /app/downloads
+RUN mkdir -p /downloads
 
 EXPOSE 7777
 
