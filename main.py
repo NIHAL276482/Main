@@ -403,7 +403,7 @@ async def background_yt_dlp_download(url, path, download_type, quality=None, coo
 # Terabox handler
 @cached(ttl=300, cache=Cache.MEMORY)
 async def handle_terabox(url: str, request: Request, is_authenticated: bool):
-    api_url = f"http://127.0.0.1:8000/?url={url}"
+    api_url = f"https://tb.hosters.club/?url={url}"
     max_retries = 3
     retry_status_codes = [400, 404, 405, 504]
     for attempt in range(max_retries):
