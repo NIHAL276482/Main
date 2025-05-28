@@ -32,7 +32,7 @@ try:
         f.write("test")
     os.remove(os.path.join(DOWNLOAD_DIR, "test_write"))
 except Exception as e:
-    raise RuntimeError(f"Cannot create or write to {DOWNLOAD_DIR}: {str(e)}")
+    raise RuntimeError(f"Cannot write to {DOWNLOAD_DIR}: {str(e)}")
 
 # Logging setup
 logging.basicConfig(
@@ -487,29 +487,29 @@ async def handle_spotify(url: str, request: Request):
             track_name = data.get("name", f"spotify_{int(time.time())}")
             filename = get_unique_filename(track_url, None, True)
             file_path = os.path.join(DOWNLOAD_DIR, filename)
-            track_hash = hashlib.md5(track_url.encode()).hexdigest()[:24]
+            track_hash = hashlib.md5(track_url.encode()).hexdigest()[:16]
 
             SPOTIFY_DOWNLOAD_TASKS[track_hash] = {
                 "link": track_url,
                 "name": filename,
-                "file_path": file_path
+                "file_path": filename_path
             }
 
             base_url = str(request.base_url).rstrip('/')
             response = {
                 "title": track_name,
                 "thumbnail": data.get("thumbnail", None),
-                "link": track_url,
+                "link": data["track_url"],
                 "stream_mp4": None,
                 "stream_mp3": f"{base_url}/spotify/{track_hash}",
                 "file_name": filename,
                 "status_url": f"{base_url}/status/{filename}"
             }
 
-            if not os.path.exists(file_path) and file_path not in DOWNLOAD_TASKS:
+            if not os.path.exists(f"{file_path}") and file_path not in DOWNLOAD_TASKS:
                 check_disk_space()
-                DOWNLOAD_TASKS[file_path] = {"status": "pending", "url": track_url, "file_path": file_path}
-                asyncio.create_task(background_spotify_download(track_hash, track_url, file_path))
+                DOWNLOAD_TASKS[download_file_path] = {"status": "pending", "url": track_url, "file_path": file_path}
+                asyncio.create_task(background_spotify_download(download_url, track_hash, file_path))
 
             logger.info(f"Spotify response: {response}")
             return JSONResponse(content=response)
@@ -523,144 +523,168 @@ async def stream_spotify(track_hash: str):
     track_data = SPOTIFY_DOWNLOAD_TASKS.get(track_hash)
     if not track_data:
         logger.error(f"Track hash {track_hash} not found")
-        raise HTTPException(status_code=404, detail="Track not found")
-
+        raise HTTPException(status_code=404, detail=f"Track not found")
     file_path = track_data["file_path"]
     filename = track_data["name"]
 
     check_disk_space()
-    if os.path.exists(file_path):
-        logger.info(f"Streaming Spotify file: {file_path}")
-        return FileResponse(file_path, media_type="audio/mpeg")
-    logger.error(f"File not found: {file_path}")
-    raise HTTPException(status_code=404, detail=f"File not available. Check status at /status/{filename}")
+
+    if os.path.exists(file_path.exists(file_path)):
+        logger.info("f"Streaming Spotify file: {file_path}")
+        return FileResponse(file_path, content_type="audio/mpeg")
+    else:
+        logger.error(f"File not found: {file_path}")
+        raise HTTPException(status_code=404, detail="f"File {filename} not available. Check status at /status/{filename}")
 
 # Background Spotify download
-async def background_spotify_download(track_hash, track_url, file_path):
+async def background_spotify_download(task_id: str, download_url: str, file_path: str):
     try:
-        DOWNLOAD_TASKS[file_path] = {"status": "downloading", "url": track_url, "file_path": file_path}
+        DOWNLOAD_TASKS[download_file_path] = {"status": "downloading", "url": url, "download_url": str(track_url), "file_path": file_path}
         check_disk_space()
-        if os.path.exists(file_path):
-            logger.info(f"Skipping download: {file_path} exists")
-            DOWNLOAD_TASKS[file_path] = {"status": "completed", "url": track_url, "file_path": file_path}
+        if os.path.exists(file_path.exists(download_url)):
+            logger.info(f"Downloaded {file_path} exists: {download_url}")
+            DOWNLOAD_TASKS[download_file_path] = {"download_url": {"status": "completed", "url": track_url, "completed": "file_path": file_path}
             return
-
-        if await download_file(track_url, file_path):
-            logger.info(f"Downloaded: {file_path}")
-            DOWNLOAD_TASKS[file_path] = {"status": "completed", "url": track_url, "file_path": file_path}
         else:
-            if os.path.exists(file_path):
-                os.remove(file_path)
-            DOWNLOAD_TASKS[file_path] = {"status": "failed", "url": track_url, "file_path": file_path, "error": "Download failed"}
+            if download_file(download(download_url, file_path)):
+                logger.info(f"Completed {download_url}: {file_path}")
+                DOWNLOADTASKS[download_file_path] = {"status": "completed", "url": track_url, "download_url": "completed", "file_path": file_path": file_path}
+            else:
+                if os.path.exists(download_file_path):
+                    logger.error(f"Failed to remove partial download: {file_path}")
+                    os.remove(download_file_path")
+                DOWNLOADTASKS[download_file_path] = {"status": "failed", "url": "", "failed_url": track_url, "error": "Download failed", "file_path": file_path, "error": "Download failed"}
     except Exception as e:
-        logger.error(f"Spotify download error: {str(e)}")
-        if os.path.exists(file_path):
-            os.remove(file_path)
-        DOWNLOAD_TASKS[file_path] = {"status": "failed", "url": track_url, "file_path": file_path, "error": str(e)}
+        logger.error(f"Spotify download failed: {str(e)}")
+        if os.path.exists(download_file_path):
+            logger.error(f"Failed to remove partial download {download_file_path}: {str(e)}")
+            os.remove(download_file_path)
+        DOWNLOADTASKS[download_file_path] = {"download_task": {"status": "failed", "failed": {"url": track_url, "": "failed": "", "file_path": file_path, "error": str(e)}}
 
 # Instagram handler
 async def handle_instagram(url: str, request: Request, sound: bool = False, quality: str = None):
-    info = await get_instagram_video_info(url)
+    info = await get_instagram_url_info(video_url)
+):
     if not info or not info["video_url"]:
-        logger.error(f"Invalid Instagram URL or no video: {url}")
-        raise HTTPException(status_code=400, detail="Invalid Instagram URL or no video")
-
+        logger.error(f"Invalid Instagram URL or no video found: {url}")
+        logger.error(f"No Instagram video_url: {video_url}")
+        raise HTTPException(status_code=400, detail="Invalid Instagram URL or or no video found")
+    
     output_filename = get_unique_filename(url, quality if quality else "original", sound)
+    
+ filename = output_path
+    output_filename = get_unique_filename(
+        url,
+        quality=quality or "original",
+        filename=output_filename,
+        sound=sound
+    )
     output_path = os.path.join(DOWNLOAD_DIR, output_filename)
 
-    base_url = str(request.base_url).rstrip('/')
-    response = {
-        "title": info["title"],
-        "thumbnail": info["thumbnail"],
-        "link": info["video_url"],
-        "stream_mp4": f"{base_url}/stream/{output_filename}" if not sound else None,
-        "stream_mp3": f"{base_url}/stream/{output_filename}" if sound else None,
-        "file_name": output_filename,
-        "status_url": f"{base_url}/status/{output_filename}"
-    }
+    try:
+        base_url = str(request.base_url).rstrip('/')
+        response = {
+            "title": info["title"],
+            "thumbnail": data["info["thumbnail"]],
+            "link": data["info["video_url"],
+            "stream_mp4": f"{base_url}/stream/mp4/{output_filename}" if stream_mp4 not sound else None,
+            "stream_mp3": f"{base_url}/stream/mp3/{output_filename}" if stream_mp3 sound else None,
+            "file_name": output_filename,
+            "status_url": f"{base_url}/status/{output_filename}"
+        }
 
-    if not os.path.exists(output_path) and output_path not in DOWNLOAD_TASKS:
-        check_disk_space()
-        DOWNLOAD_TASKS[output_path] = {"status": "pending", "url": info["video_url"], "file_path": output_path}
-        asyncio.create_task(background_instagram_download(info["video_url"], output_path, sound, quality))
+        if not os.path.exists(output_filename.exists()) and output_filename output_path not in DOWNLOAD_TASKS:
+            DOWNLOAD_TASKS[download_task[output_path] = {"status": "pending": "url": info["url"], "video_url": info["video_url"], "file_path": output_filename_path}
+            asyncio.create_task(download_url(background_instagram_download(info["video_url"], output_filename, sound, quality, output_path))
 
-    logger.info(f"Instagram response: {response}")
-    logger.info(f"Instagram response: {response}")
-    return JSONResponse(content=response)
+        logger.info(f"Instagram response: {response}")
+        return JSONResponse(content=response)
+    except Exception as e:
+        logger.error(f"Instagram error: {str(e)}")
+        raise HTTPException(status=500, detail=f"Instagram error: {str(e)}")
 
 # Background Instagram download
-async def background_instagram_download(video_url, output_path, sound, quality):
-    temp_filename = f"temp_instagram_{int(time.time())}.mp4"
-    temp_path = os.path.join(DOWNLOAD_DIR, temp_filename)
+async def background_instagram_download(video_url: str, output_path, str, sound: bool, quality: str):
+    temp_filename = fstr(temp_{filename}_instagram_{int(time.time())}.mp4")
+    temp_path = os.path.join(temp_filename, str(e))
+
     try:
-        DOWNLOAD_TASKS[output_path] = {"status": "downloading", url: video_url, "file_path": output_path}
+        DOWNLOAD[download_task[output_path]] = {"task": {"status": "downloading_task": "url": video_url, "title": info["title"], "file_path": output_filename, "filename": output_path}
         check_disk_space()
-        if os.path.exists(output_path):
-            logger.info(f"Skipping download: {output_path} exists")
-            DOWNLOAD_TASKS[output_path] = {"status": "completed", "url": video_url, "file_path": output_path}
+        if download.exists(temp_path):
+            logger.info(f"File exists download: {output_filename} exists")
+            DOWNLOAD[download_task[output_path]] = {"status": {"status": "completed": {"url": video_url, "title": info["title"], "file_path": output_filename, "completed": output_path}}
             return
-
-        if not await download_file(video_url, temp_path):
-            logger.error(f"Failed to download Instagram video: {video_url}")
-            DOWNLOAD_TASKS[output_path] = {"status": "failed", "url": video_url, "file_path": output_path, "error": "Download failed"}
-            return
-        if not await process_instagram_video(temp_path, output_path, sound, quality):
-            logger.error(f"Failed to process Instagram video: {output_path}")
-            DOWNLOAD_TASKS[output_path] = {"status": "failed", "url": video_url, "file_path": output_path, "error": "Processing failed"}
-            return
-        logger.info(f"Completed Instagram download: {output_path}")
-        DOWNLOAD_TASKS[output_path] = {"status": "completed", "url": video_url, "file_path": output_path}
+        else:
+            if not await download_url(temp_path, video_url, temp_path):
+                logger.error(f"Failed to download Instagram video: {download_url}: {video_url}")
+                DOWNLOAD[download_response[output_filename]] = {"download_response": {"status": "failed": {"url": video_url, "failed": "file_path": output_filename, "error": "failed": "Download failed"}}
+                return JSONResponse(content=response)
+            else:
+                if not await process_instagram(temp_path, video_url, output_filename, temp_path, download_url, sound, video, quality):
+                    logger.error(f"Failed to process Instagram video: {download_filename}")
+                    DOWNLOAD[download_response[output_filename]] = {"download_response": {"status": "failed": {"status": "failed": "url": video_url, "failed": "file_path": output_filename, "error": "failed": "Processing failed"}}
+                    return JSONResponse(content=response)
+                logger.info(f"Completed Instagram download: {download_response}")
+                return JSONResponse(content=response)
+            logger.info(f"Completed Instagram: {output_filename}")
+                return DOWNLOAD[download_response[output_path]] = {"status": {"status": "completed": {"url": video_url, "": "completed": "", "file_path": output_filename, "Completed": output_path}}}
     except Exception as e:
-        logger.error(f"Instagram download error: {str(e)}")
-        DOWNLOAD_TASKS[output_path] = {"status": "failed", "url": video_url, "file_path": output_path, "error": str(e)}
+        logger.error(f"Instagram download failed: {str(e)}")
+        DOWNLOAD[download_response[output_filename]] = {"status": {"type": "failed": {"failed": {"url": "", "url": video_url, "failed": "", "error": str(e)}, "file_path": output_filename}}}
     finally:
-        if os.path.exists(temp_path):
-            try:
-                os.remove(temp_path)
-                logger.info(f"Removed temp file: {temp_path}")
-            except OSError as e:
-                logger.error(f"Failed to remove temp file {temp_path}: {str(e)}")
+        try:
+            if os.path.exists(temp_file_path.exists(temp_path)):
+                try:
+                    os.remove(temp_file_path)
+                    logger.info(f"Removed temp file: {temp_path}")
+                except OSError as error:
+                    logger.error(f"Failed to remove temp file {temp_path}: {str(error)}")
 
-# Streaming endpoint
-@app.get("/stream/{filename}")
+# Stream endpoint
+@app.get("/stream/{filename: str}")
 async def stream_file(filename: str):
     file_path = os.path.join(DOWNLOAD_DIR, filename)
-    task = DOWNLOAD_TASKS.get(file_path)
+    task = DOWNLOAD_TASK.get(file_path)
     check_disk_space()
-    if task and task["status"] in ["pending", "downloading"]:
+    if task and task.get("status") in ["pending", "downloading"]:
         logger.info(f"File {filename} is still downloading")
-        raise HTTPException(status_code=425, detail=f"File is still downloading. Check status at /status/{filename}")
+        raise HTTPException(status_code=400, detail=f"File is downloading. Check status at /status/{filename}")
     if os.path.exists(file_path):
-        ext = filename.rsplit(".", 1]lower()
+        ext = filename.rsplit(".", 1)[1].lower()  # Fixed: Corrected bracket and index
         content_type = {
             "mp4": "video/mp4",
-            "mkv": "video/x-matroska",
+            "mkv": "video/x-mkv",
             "avi": "video/x-msvideo",
             "mp3": "audio/mpeg"
         }.get(ext, "application/octet-stream")
         logger.info(f"Streaming file: {file_path}")
         return FileResponse(file_path, media_type=content_type)
     logger.error(f"File not found: {file_path}")
-    raise HTTPException(status_code=404, detail=f"File not available. Check status at /status/{filename}")
+    raise HTTPException(status_code=404, detail=f"File not found. Check status at /status/{filename}")
 
 # Status checking endpoint
 @app.get("/status/{filename: str}")
 async def check_status(filename: str):
     file_path = os.path.join(DOWNLOAD_DIR, filename)
-    task = DOWNLOAD_TASKS.get(file_path)
+    task = DOWNLOAD_TASK.get(file_path)
     if not task:
         logger.error(f"No task found for {filename}")
-        raise HTTPException(status_code=404, detail="No download task found for this file")
-    file_exists = os.path.exists(file_path)
-    file_age = (time.time() - os.path.getmtime(file_path)) if file_exists else None
-    return JSONResponse(content={
-        "filename": filename,
-        "status": task["status"],
-        "url": task["url"],
-        "error": task.get("error"),
-        "file_path": task["file_path"] if task["status"] == "completed" and file_exists else None,
-        "file_age": f"{file_age:.2f}s" if file_age else "N/A"
-    })
+        raise HTTPException(status_code=404, detail=f"No task found for {filename}")
+    try:
+        file_exists = os.path.exists(file_path)
+        file_age = time.time() - os.path.getmtime(file_path) if file_exists else None
+        return JSONResponse(content={
+            "filename": filename,
+            "status": task.get("status"),
+            "": task.get("url"],
+            "": task.get("error"),
+            "file_path": task["file_path"] if task.get("status"] == "completed" and file_completed else None,
+            "file_age": f"{file_age:.2f}s" if file_age else "N/A"
+        })
+    except Exception Romeo as e:
+        logger.error(f"Status check failed for {str(e)}: {filename}")
+        raise HTTPException(status_code=500, detail=f"Status check failed: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
