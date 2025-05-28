@@ -5,19 +5,17 @@ import time
 import aiohttp
 import aiofiles
 import json
+import re
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from functools import lru_cache
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from aiocache import Cache, cached
-import base64
 import hashlib
 import instaloader
 from werkzeug.utils import secure_filename
-from urllib.parse import urlparse, urlunparse
-import uuid
-from bs4 import BeautifulSoup
+from urllib.parse import urlparse
 import shutil
 
 app = FastAPI()
@@ -28,8 +26,8 @@ SPOTIFY_DOWNLOAD_TASKS = {}
 COOKIES_FILE = "/app/cookies.txt"
 
 # Ensure DOWNLOAD_DIR exists and is writable
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 try:
-    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
     with open(os.path.join(DOWNLOAD_DIR, "test_write"), "w") as f:
         f.write("test")
     os.remove(os.path.join(DOWNLOAD_DIR, "test_write"))
@@ -72,8 +70,26 @@ def check_disk_space():
     total, used, free = shutil.disk_usage(DOWNLOAD_DIR)
     usage_percent = (used / total) * 100
     if usage_percent > 90:
-        logger.warning(f"Disk usage high: {usage_percent:.1f}% used ({free / (1024**3):.1f}GB free)")
-    return free / (1024**3)  # Free space in GB
+        logger.warning(f"Disk usage high: {usage_percent:.1f}% used ({free / (1024**3):.2f}GB free)")
+    return free / (1024 ** 3)  # Free space in GB
+
+# Parse YouTube video ID from URL or raw ID
+def parse_youtube_id(url_or_id: str) -> str:
+    """
+    Extract YouTube video ID from a URL or return the raw ID if valid.
+    Supports: youtube.com, youtu.be, m.youtube.com, embed, live URLs.
+    Returns: 11-character video ID or raises HTTPException if invalid.
+    """
+    # Valid ID: 11 chars, letters, hyphen, underscore
+    if re.match(r'^[A-Za-z0-9\-_]{11}$', url_or_id):
+        return url_or_id
+    # Regex to match various YouTube URL formats
+    pattern = r'(?:youtube(?:-nocookie)?\.com/(?:[^/]+/.+/|(?:v|e(?:mbed)?)/|watch\?(?:.*&)?v=|live/)|youtu\.be/)([A-Za-z0-9\-_]{11})'
+    match = re.search(pattern, url_or_id, re.IGNORECASE)
+    if match:
+        return match.group(1)
+    logger.error(f"Invalid YouTube URL or ID: {url_or_id}")
+    raise HTTPException(status_code=400, detail="Invalid YouTube URL or video ID")
 
 # Clean YouTube URL
 def clean_youtube_url(url):
@@ -81,7 +97,7 @@ def clean_youtube_url(url):
         parsed = urlparse(url)
         if parsed.netloc.endswith("googlevideo.com"):
             return url
-        cleaned = urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", "", ""))
+        cleaned = parsed._replace(query="").geturl()
         logger.debug(f"Cleaned YouTube URL: {url} to {cleaned}")
         return cleaned
     except Exception as e:
@@ -93,19 +109,23 @@ async def clean_old_files():
     now = time.time()
     free_space = check_disk_space()
     if free_space < 0.5:  # Less than 0.5GB free
-        logger.error(f"Low disk space: {free_space:.1f}GB free. Consider manual cleanup.")
+        logger.warning(f"Low disk space: {free_space:.2f}GB free. Consider manual cleanup.")
     for filename in os.listdir(DOWNLOAD_DIR):
         file_path = os.path.join(DOWNLOAD_DIR, filename)
         if os.path.isfile(file_path):
-            file_age = now - min(os.path.getmtime(file_path), os.path.getctime(file_path))
-            if file_age > CACHE_DURATION:
-                try:
+            try:
+                mtime = os.path.getmtime(file_path)
+                file_age = now - mtime
+                logger.debug(f"Checking file {filename}: age={file_age:.2f}s, mtime={mtime}")
+                if file_age > CACHE_DURATION:
                     os.remove(file_path)
-                    logger.info(f"Removed expired file: {file_path}")
+                    logger.info(f"Removed expired file: {file_path} (age={file_age:.2f}s)")
                     if file_path in DOWNLOAD_TASKS:
                         del DOWNLOAD_TASKS[file_path]
-                except OSError as e:
-                    logger.error(f"Failed to remove {file_path}: {str(e)}")
+                elif file_age < 0:
+                    logger.warning(f"File {filename} has future timestamp: mtime={mtime}, now={now}")
+            except OSError as e:
+                logger.error(f"Failed to process {file_path}: {str(e)}")
 
 # URL type detection
 def is_spotify_url(url): 
@@ -126,10 +146,11 @@ def get_unique_filename(url, quality=None, sound=False):
     file_path = os.path.join(DOWNLOAD_DIR, filename)
 
     if os.path.exists(file_path):
-        file_age = time.time() - min(os.path.getmtime(file_path), os.path.getctime(file_path))
+        file_age = time.time() - os.path.getmtime(file_path)
         if file_age < CACHE_DURATION:
-            logger.debug(f"Reusing existing file: {filename}")
+            logger.debug(f"Reusing existing file: {filename} (age={file_age:.2f}s)")
             return filename
+        logger.info(f"Expired file exists: {filename} (age={file_age:.2f}s), will redownload")
     
     if file_path in DOWNLOAD_TASKS:
         logger.debug(f"Download task exists for: {filename}")
@@ -194,14 +215,14 @@ async def download_file(url, path, retries=3):
                             async for chunk in response.content.iter_chunked(1024):
                                 await f.write(chunk)
                         logger.info(f"Downloaded: {path}")
-                        return
+                        return True
                     logger.error(f"Download failed {url}: Status {response.status}")
                     await asyncio.sleep(2 ** (attempt + 1))
             except aiohttp.ClientError as e:
                 logger.error(f"Download error {url}: {str(e)}")
                 if attempt < retries - 1:
                     await asyncio.sleep(2 ** (attempt + 1))
-        raise HTTPException(status_code=500, detail="Download failed after retries")
+        return False
 
 # Instagram video info
 async def get_instagram_video_info(url):
@@ -311,16 +332,17 @@ async def youtube_download(request: Request):
     if not video_id:
         raise HTTPException(status_code=400, detail="id parameter required")
 
-    # Handle video ID or full URL
-    if video_id.startswith("http"):
-        url = video_id
-    else:
-        # Assume video_id is a YouTube ID (e.g., "abcdefgh")
-        if not all(c.isalnum() or c in "-_" for c in video_id):
-            raise HTTPException(status_code=400, detail="Invalid YouTube video ID")
-        url = f"https://www.youtube.com/watch?v={video_id}"
+    try:
+        # Extract video ID from URL or validate raw ID
+        parsed_id = parse_youtube_id(video_id)
+        url = f"https://www.youtube.com/watch?v={parsed_id}"
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        logger.error(f"Error parsing video ID {video_id}: {str(e)}")
+        raise HTTPException(status_code=400, detail="Failed to parse YouTube video ID")
 
-    logger.info(f"/yt: video_id={video_id}, url={url}, sound={sound}, quality={quality}")
+    logger.info(f"/yt: video_id={video_id}, parsed_id={parsed_id}, url={url}, sound={sound}, quality={quality}")
 
     if not check_yt_dlp():
         raise HTTPException(status_code=500, detail="yt-dlp not installed")
@@ -377,10 +399,14 @@ async def handle_yt_dlp(url: str, request: Request, sound: bool = False, quality
 async def background_yt_dlp_download(url, path, download_type, quality=None, cookie_option="", common_options=""):
     try:
         DOWNLOAD_TASKS[path] = {"status": "downloading", "url": url, "file_path": path}
-        if os.path.exists(path) and time.time() - min(os.path.getmtime(path), os.path.getctime(path)) < CACHE_DURATION:
-            logger.info(f"Skipping download: {path} exists")
-            DOWNLOAD_TASKS[path] = {"status": "completed", "url": url, "file_path": path}
-            return
+        if os.path.exists(path):
+            file_age = time.time() - os.path.getmtime(path)
+            if file_age < CACHE_DURATION:
+                logger.info(f"Skipping download: {path} exists (age={file_age:.2f}s)")
+                DOWNLOAD_TASKS[path] = {"status": "completed", "url": url, "file_path": path}
+                return
+            logger.info(f"Expired file exists: {path} (age={file_age:.2f}s), removing")
+            os.remove(path)
 
         for attempt in range(3):
             try:
@@ -528,9 +554,9 @@ async def stream_spotify(track_hash: str):
     filename = track_data["name"]
 
     if os.path.exists(file_path):
-        file_age = time.time() - min(os.path.getmtime(file_path), os.path.getctime(file_path))
+        file_age = time.time() - os.path.getmtime(file_path)
         if file_age > CACHE_DURATION:
-            logger.info(f"File expired: {file_path}")
+            logger.info(f"File expired: {file_path} (age={file_age:.2f}s)")
             os.remove(file_path)
             if file_path in DOWNLOAD_TASKS:
                 del DOWNLOAD_TASKS[file_path]
@@ -544,10 +570,14 @@ async def stream_spotify(track_hash: str):
 async def background_spotify_download(track_hash, track_url, file_path):
     try:
         DOWNLOAD_TASKS[file_path] = {"status": "downloading", "url": track_url, "file_path": file_path}
-        if os.path.exists(file_path) and time.time() - min(os.path.getmtime(file_path), os.path.getctime(file_path)) < CACHE_DURATION:
-            logger.info(f"Skipping download: {file_path} exists")
-            DOWNLOAD_TASKS[file_path] = {"status": "completed", "url": track_url, "file_path": file_path}
-            return
+        if os.path.exists(file_path):
+            file_age = time.time() - os.path.getmtime(file_path)
+            if file_age < CACHE_DURATION:
+                logger.info(f"Skipping download: {file_path} exists (age={file_age:.2f}s)")
+                DOWNLOAD_TASKS[file_path] = {"status": "completed", "url": track_url, "file_path": file_path}
+                return
+            logger.info(f"Expired file exists: {file_path} (age={file_age:.2f}s), removing")
+            os.remove(file_path)
 
         if await download_file(track_url, file_path):
             logger.info(f"Downloaded: {file_path}")
@@ -596,10 +626,14 @@ async def background_instagram_download(video_url, output_path, sound, quality):
     temp_path = os.path.join(DOWNLOAD_DIR, temp_filename)
     try:
         DOWNLOAD_TASKS[output_path] = {"status": "downloading", "url": video_url, "file_path": output_path}
-        if os.path.exists(output_path) and time.time() - min(os.path.getmtime(output_path), os.path.getctime(output_path)) < CACHE_DURATION:
-            logger.info(f"Skipping download: {output_path} exists")
-            DOWNLOAD_TASKS[output_path] = {"status": "completed", "url": video_url, "file_path": output_path}
-            return
+        if os.path.exists(output_path):
+            file_age = time.time() - os.path.getmtime(output_path)
+            if file_age < CACHE_DURATION:
+                logger.info(f"Skipping download: {output_path} exists (age={file_age:.2f}s)")
+                DOWNLOAD_TASKS[output_path] = {"status": "completed", "url": video_url, "file_path": output_path}
+                return
+            logger.info(f"Expired file exists: {output_path} (age={file_age:.2f}s), removing")
+            os.remove(output_path)
 
         if not await download_file(video_url, temp_path):
             logger.error(f"Failed to download Instagram video: {video_url}")
@@ -631,12 +665,17 @@ async def stream_file(filename: str):
         logger.info(f"File {filename} is still downloading")
         raise HTTPException(status_code=425, detail=f"File is still downloading. Check status at /status/{filename}")
     if os.path.exists(file_path):
-        file_age = time.time() - min(os.path.getmtime(file_path), os.path.getctime(file_path))
+        mtime = os.path.getmtime(file_path)
+        file_age = time.time() - mtime
+        logger.debug(f"Streaming {filename}: age={file_age:.2f}s, mtime={mtime}")
         if file_age > CACHE_DURATION:
-            logger.info(f"File expired: {file_path}")
-            os.remove(file_path)
-            if file_path in DOWNLOAD_TASKS:
-                del DOWNLOAD_TASKS[file_path]
+            logger.info(f"File expired: {file_path} (age={file_age:.2f}s)")
+            try:
+                os.remove(file_path)
+                if file_path in DOWNLOAD_TASKS:
+                    del DOWNLOAD_TASKS[file_path]
+            except OSError as e:
+                logger.error(f"Failed to remove expired file {file_path}: {str(e)}")
             raise HTTPException(status_code=404, detail="File expired")
         ext = filename.rsplit(".", 1)[-1].lower()
         content_type = {
@@ -658,14 +697,17 @@ async def check_status(filename: str):
     if not task:
         logger.error(f"No task found for {filename}")
         raise HTTPException(status_code=404, detail="No download task found for this file")
+    file_exists = os.path.exists(file_path)
+    file_age = (time.time() - os.path.getmtime(file_path)) if file_exists else None
     return JSONResponse(content={
         "filename": filename,
         "status": task["status"],
         "url": task["url"],
         "error": task.get("error"),
-        "file_path": task["file_path"] if task["status"] == "completed" else None
+        "file_path": task["file_path"] if task["status"] == "completed" and file_exists else None,
+        "file_age": f"{file_age:.2f}s" if file_age else "N/A"
     })
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=7777)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
