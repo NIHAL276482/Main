@@ -19,21 +19,13 @@ from urllib.parse import urlparse, urlunparse
 import uuid
 from bs4 import BeautifulSoup
 from http.cookiejar import MozillaCookieJar
-from TeraboxDL import TeraboxDL  # Assumes pip-installed; provide if custom
 
 app = FastAPI()
 DOWNLOAD_DIR = "/app/downloads"
 CACHE_DURATION = 43200  # 12 hours
-TERABOX_LINKS = {}
 DOWNLOAD_TASKS = {}
 SPOTIFY_DOWNLOAD_TASKS = {}
 COOKIES_FILE = "/app/cookies.txt"
-
-# Supported Terabox domains
-SUPPORTED_DOMAINS = [
-    "terabox.com", "terabox.app", "terabox.me",
-    "1024terabox.com", "teraboxd.com", "terabox.club"
-]
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
@@ -98,8 +90,6 @@ async def clean_old_files():
                     logger.error(f"Failed to remove {file_path}: {str(e)}")
 
 # URL type detection
-def is_terabox_url(url): 
-    return any(domain in url.lower() for domain in SUPPORTED_DOMAINS)
 def is_spotify_url(url): 
     return "spotify.com" in url.lower()
 def is_instagram_url(url): 
@@ -147,25 +137,6 @@ def validate_cookies_file():
         logger.error(f"Error reading cookies.txt: {str(e)}")
         return False
 
-# Load ndus cookie for Terabox
-def load_ndus_cookie():
-    if not os.path.exists(COOKIES_FILE):
-        logger.error("cookies.txt not found")
-        return None
-    cookie_jar = MozillaCookieJar()
-    try:
-        cookie_jar.load(COOKIES_FILE, ignore_discard=True, ignore_expires=True)
-        for domain in SUPPORTED_DOMAINS:
-            for cookie in cookie_jar:
-                if cookie.name == "ndus" and domain in cookie.domain:
-                    logger.info(f"Found ndus cookie for {cookie.domain}")
-                    return f"lang=en; ndus={cookie.value}"
-        logger.error("No ndus cookie found")
-        return None
-    except Exception as e:
-        logger.error(f"Error reading cookies.txt: {str(e)}")
-        return None
-
 # Metadata extraction
 @lru_cache(maxsize=100)
 def get_yt_dlp_metadata(url):
@@ -184,7 +155,9 @@ def get_yt_dlp_metadata(url):
                     raise HTTPException(403, "Authentication required. Update cookies.txt.")
                 if attempt == 2:
                     return {"title": "Unknown Title", "thumbnail": None}
-                time.sleep(2 ** (attempt + 1))
+                time
+
+.sleep(2 ** (attempt + 1))
                 continue
             data = json.loads(process.stdout)
             title = data.get("title", "Unknown Title")
@@ -272,10 +245,6 @@ async def download_video(request: Request):
         if sound or quality:
             raise HTTPException(400, "Spotify URLs do not support &sound or &quality")
         return await handle_spotify(url, request)
-    elif is_terabox_url(url):
-        if sound or quality:
-            raise HTTPException(400, "Terabox URLs do not support &sound or &quality")
-        return await handle_terabox(url, request)
     elif is_instagram_url(url):
         return await handle_instagram(url, request, sound, quality)
     elif is_yt_dlp_supported(url):
@@ -418,66 +387,6 @@ async def background_yt_dlp_download(url, path, download_type, quality=None, coo
         if os.path.exists(path):
             os.remove(path)
         DOWNLOAD_TASKS[path] = {"status": "failed", "url": url, "error": str(e)}
-
-# Terabox handler
-@cached(ttl=300, cache=Cache.MEMORY)
-async def handle_terabox(url: str, request: Request):
-    if not is_terabox_url(url):
-        logger.error(f"Invalid Terabox URL: {url}")
-        raise HTTPException(400, "Invalid Terabox URL")
-
-    cookie = load_ndus_cookie()
-    if not cookie:
-        raise HTTPException(400, "No valid ndus cookie in cookies.txt")
-
-    try:
-        terabox = TeraboxDL(cookie)
-        logger.info(f"TeraboxDL initialized for: {url}")
-    except Exception as e:
-        logger.error(f"TeraboxDL init failed: {str(e)}")
-        raise HTTPException(500, f"TeraboxDL init failed: {str(e)}")
-
-    try:
-        file_info = terabox.get_file_info(url)
-        logger.info(f"File info: {file_info}")
-        if "error" in file_info:
-            logger.error(f"TeraboxDL error: {file_info['error']}")
-            raise HTTPException(400, f"Fetch failed: {file_info['error']}")
-
-        thumbnail = file_info.get("thumbnail", "")
-        if thumbnail and (not isinstance(thumbnail, str) or not thumbnail.startswith("https://")):
-            logger.warning(f"Invalid thumbnail: {thumbnail}, setting to null")
-            thumbnail = None
-
-        size_bytes = int(file_info.get("size_bytes", 0))
-        direct_link = file_info.get("download_link", "")
-        filename = file_info.get("file_name", f"terabox_{int(time.time())}.mp4")
-        file_path = os.path.join(DOWNLOAD_DIR, filename)
-        link_hash = base64.urlsafe_b64encode(hashlib.md5(direct_link.encode()).digest()).decode()[:24]
-
-        TERABOX_LINKS[link_hash] = {"link": direct_link, "name": filename}
-
-        base_url = str(request.base_url).rstrip('/')
-        response = {
-            "title": file_info.get("file_name", "Terabox Video"),
-            "thumbnail": thumbnail,
-            "bytes": size_bytes,
-            "size": f"{round(size_bytes / (1024 * 1024), 2)} mb",
-            "link": direct_link,
-            "stream_mp4": f"{base_url}/tb/{link_hash}",
-            "stream_mp3": None,
-            "file_name": filename
-        }
-
-        if not os.path.exists(file_path) and file_path not in DOWNLOAD_TASKS:
-            DOWNLOAD_TASKS[file_path] = {"status": "pending", "url": direct_link}
-            asyncio.create_task(background_download(link_hash, direct_link, file_path))
-
-        logger.info(f"Terabox response: {response}")
-        return JSONResponse(response)
-    except Exception as e:
-        logger.error(f"Terabox fetch error: {str(e)}")
-        raise HTTPException(500, f"Fetch error: {str(e)}")
 
 # Spotify handler
 @cached(ttl=300, cache=Cache.MEMORY)
@@ -681,66 +590,6 @@ async def stream_file(filename: str):
         }.get(ext, "application/octet-stream")
         return FileResponse(file_path, media_type=content_type)
     raise HTTPException(404, "File not available")
-
-# Terabox streaming
-@app.get("/tb/{link_hash}")
-async def stream_terabox(link_hash: str):
-    link_data = TERABOX_LINKS.get(link_hash)
-    if not link_data:
-        raise HTTPException(404, "Link not found")
-
-    file_path = os.path.join(DOWNLOAD_DIR, link_data["name"])
-    if os.path.exists(file_path):
-        file_age = time.time() - min(os.path.getmtime(file_path), os.path.getctime(file_path))
-        if file_age > CACHE_DURATION:
-            os.remove(file_path)
-            if file_path in DOWNLOAD_TASKS:
-                del DOWNLOAD_TASKS[file_path]
-            raise HTTPException(404, "File expired")
-        ext = link_data["name"].rsplit(".", 1)[-1].lower()
-        content_type = {
-            "mp4": "video/mp4",
-            "mkv": "video/x-matroska",
-            "avi": "video/x-msvideo",
-            "mp3": "audio/mpeg"
-        }.get(ext, "application/octet-stream")
-        return FileResponse(file_path, media_type=content_type)
-    raise HTTPException(404, "File not available")
-
-# Terabox status check
-@app.get("/tb_status/{link_hash}")
-async def check_download_status(link_hash: str, request: Request):
-    task = DOWNLOAD_TASKS.get(os.path.join(DOWNLOAD_DIR, TERABOX_LINKS.get(link_hash, {}).get("name", "")))
-    if not task:
-        raise HTTPException(404, "No download task found")
-    base_url = str(request.base_url).rstrip('/')
-    return JSONResponse({
-        "status": task["status"],
-        "stream_link": f"{base_url}/stream/{os.path.basename(task.get('file_path', ''))}" if task["status"] == "completed" else None,
-        "error": task.get("error")
-    })
-
-# Background download
-async def background_download(link_hash, link, file_path):
-    try:
-        DOWNLOAD_TASKS[file_path] = {"status": "downloading", "url": link}
-        if os.path.exists(file_path) and time.time() - min(os.path.getmtime(file_path), os.path.getctime(file_path)) < CACHE_DURATION:
-            logger.info(f"Skipping download: {file_path} exists")
-            DOWNLOAD_TASKS[file_path] = {"status": "completed", "url": link}
-            return
-
-        if await download_file(link, file_path):
-            logger.info(f"Downloaded: {file_path}")
-            DOWNLOAD_TASKS[file_path] = {"status": "completed", "url": link}
-        else:
-            if os.path.exists(file_path):
-                os.remove(file_path)
-            DOWNLOAD_TASKS[file_path] = {"status": "failed", "url": link, "error": "Download failed"}
-    except Exception as e:
-        logger.error(f"Download error: {str(e)}")
-        if os.path.exists(file_path):
-            os.remove(file_path)
-        DOWNLOAD_TASKS[file_path] = {"status": "failed", "url": link, "error": str(e)}
 
 if __name__ == "__main__":
     import uvicorn
