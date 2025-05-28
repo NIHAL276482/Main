@@ -27,7 +27,14 @@ DOWNLOAD_TASKS = {}
 SPOTIFY_DOWNLOAD_TASKS = {}
 COOKIES_FILE = "/app/cookies.txt"
 
-os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+# Ensure DOWNLOAD_DIR exists and is writable
+try:
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    with open(os.path.join(DOWNLOAD_DIR, "test_write"), "w") as f:
+        f.write("test")
+    os.remove(os.path.join(DOWNLOAD_DIR, "test_write"))
+except Exception as e:
+    raise RuntimeError(f"Cannot create or write to {DOWNLOAD_DIR}: {str(e)}")
 
 # Logging setup
 logging.basicConfig(
@@ -153,8 +160,6 @@ def get_yt_dlp_metadata(url):
                 logger.error(f"yt-dlp metadata failed: {process.stderr}")
                 if "Sign in" in process.stderr:
                     raise HTTPException(403, "Authentication required. Update cookies.txt.")
-                if attempt == 2:
-                    return {"title": "Unknown Title", "thumbnail": None}
                 time.sleep(2 ** (attempt + 1))
                 continue
             data = json.loads(process.stdout)
@@ -168,22 +173,26 @@ def get_yt_dlp_metadata(url):
             time.sleep(2 ** (attempt + 1))
     return {"title": "Unknown Title", "thumbnail": None}
 
-# File download utility
-async def download_file(url, path):
+# File download utility with retries
+async def download_file(url, path, retries=3):
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=300)) as session:
-        try:
-            async with session.get(url) as response:
-                if response.status == 200:
-                    async with aiofiles.open(path, "wb") as f:
-                        async for chunk in response.content.iter_chunked(1024):
-                            await f.write(chunk)
-                    logger.info(f"Downloaded: {path}")
-                    return True
-                logger.error(f"Download failed {url}: Status {response.status}")
-                return False
-        except aiohttp.ClientError as e:
-            logger.error(f"Download error {url}: {str(e)}")
-            return False
+        for attempt in range(retries):
+            try:
+                async with session.get(url) as response:
+                    if response.status == 200:
+                        async with aiofiles.open(path, "wb") as f:
+                            async for chunk in response.content.iter_chunked(1024):
+                                await f.write(chunk)
+                        logger.info(f"Downloaded: {path}")
+                        return True
+                    logger.error(f"Download failed {url}: Status {response.status}")
+                    if attempt < retries - 1:
+                        await asyncio.sleep(2 ** (attempt + 1))
+            except aiohttp.ClientError as e:
+                logger.error(f"Download error {url}: {str(e)}")
+                if attempt < retries - 1:
+                    await asyncio.sleep(2 ** (attempt + 1))
+        return False
 
 # Instagram video info
 async def get_instagram_video_info(post_url):
@@ -293,7 +302,6 @@ async def youtube_download(request: Request):
     if not video_id:
         raise HTTPException(400, "id parameter required")
 
-    # Check if video_id is a full URL or just ID
     if video_id.startswith("http"):
         url = video_id
     else:
@@ -338,14 +346,15 @@ async def handle_yt_dlp(url: str, request: Request, sound: bool = False, quality
         "stream_mp4": f"{base_url}/stream/{video_filename}" if video_filename else None,
         "stream_mp3": f"{base_url}/stream/{audio_filename}" if audio_filename else None,
         "file_name_mp4": video_filename,
-        "file_name_mp3": audio_filename
+        "file_name_mp3": audio_filename,
+        "status_url": f"{base_url}/status/{video_filename}" if video_filename else f"{base_url}/status/{audio_filename}"
     }
 
     if video_filename and not os.path.exists(video_path) and video_path not in DOWNLOAD_TASKS:
-        DOWNLOAD_TASKS[video_path] = {"status": "pending", "url": url}
+        DOWNLOAD_TASKS[video_path] = {"status": "pending", "url": url, "file_path": video_path}
         asyncio.create_task(background_yt_dlp_download(url, video_path, "video", quality="1080" if not quality else quality, cookie_option=cookie_option, common_options=common_options))
     if audio_filename and not os.path.exists(audio_path) and audio_path not in DOWNLOAD_TASKS:
-        DOWNLOAD_TASKS[audio_path] = {"status": "pending", "url": url}
+        DOWNLOAD_TASKS[audio_path] = {"status": "pending", "url": url, "file_path": audio_path}
         asyncio.create_task(background_yt_dlp_download(url, audio_path, "audio", cookie_option=cookie_option, common_options=common_options))
 
     logger.info(f"Response: {response}")
@@ -354,47 +363,61 @@ async def handle_yt_dlp(url: str, request: Request, sound: bool = False, quality
 # Background yt-dlp download
 async def background_yt_dlp_download(url, path, download_type, quality=None, cookie_option="", common_options=""):
     try:
-        DOWNLOAD_TASKS[path] = {"status": "downloading", "url": url}
+        DOWNLOAD_TASKS[path] = {"status": "downloading", "url": url, "file_path": path}
         if os.path.exists(path) and time.time() - min(os.path.getmtime(path), os.path.getctime(path)) < CACHE_DURATION:
             logger.info(f"Skipping download: {path} exists")
-            DOWNLOAD_TASKS[path] = {"status": "completed", "url": url}
+            DOWNLOAD_TASKS[path] = {"status": "completed", "url": url, "file_path": path}
             return
 
-        if download_type == "video":
-            quality_map = {
-                "240": "bestvideo[height<=240][ext=mp4]+bestaudio[ext=m4a]/best[height<=240]",
-                "360": "bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/best[height<=360]",
-                "480": "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[height<=480]",
-                "720": "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720]",
-                "1080": "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080]"
-            }
-            cmd = f'yt-dlp -f "{quality_map.get(quality, "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best")}" --merge-output-format mp4 {cookie_option} {common_options} -o "{path}" "{url}"'
-        else:
-            cmd = f'yt-dlp --extract-audio --audio-format mp3 --audio-quality 320K {cookie_option} {common_options} -o "{path}" "{url}"'
+        for attempt in range(3):
+            try:
+                if download_type == "video":
+                    quality_map = {
+                        "240": "bestvideo[height<=240][ext=mp4]+bestaudio[ext=m4a]/best[height<=240]",
+                        "360": "bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/best[height<=360]",
+                        "480": "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[height<=480]",
+                        "720": "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720]",
+                        "1080": "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080]"
+                    }
+                    cmd = f'yt-dlp -f "{quality_map.get(quality, "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best")}" --merge-output-format mp4 {cookie_option} {common_options} -o "{path}" "{url}"'
+                else:
+                    cmd = f'yt-dlp --extract-audio --audio-format mp3 --audio-quality 320K {cookie_option} {common_options} -o "{path}" "{url}"'
 
-        logger.info(f"yt-dlp cmd: {cmd}")
-        process = await asyncio.create_subprocess_shell(cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        _, stderr = await process.communicate()
-        if process.returncode != 0:
-            logger.error(f"yt-dlp {download_type} failed: {stderr.decode()}")
-            if os.path.exists(path):
-                os.remove(path)
-            DOWNLOAD_TASKS[path] = {"status": "failed", "url": url, "error": stderr.decode()}
-        else:
-            logger.info(f"Completed {download_type} download: {path}")
-            DOWNLOAD_TASKS[path] = {"status": "completed", "url": url}
+                logger.info(f"yt-dlp cmd: {cmd}")
+                process = await asyncio.create_subprocess_shell(cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                stdout, stderr = await process.communicate()
+                if process.returncode != 0:
+                    logger.error(f"yt-dlp {download_type} attempt {attempt + 1} failed: {stderr.decode()}")
+                    if attempt < 2:
+                        await asyncio.sleep(2 ** (attempt + 1))
+                        continue
+                    if os.path.exists(path):
+                        os.remove(path)
+                    DOWNLOAD_TASKS[path] = {"status": "failed", "url": url, "file_path": path, "error": stderr.decode()}
+                    return
+                logger.info(f"Completed {download_type} download: {path}")
+                DOWNLOAD_TASKS[path] = {"status": "completed", "url": url, "file_path": path}
+                return
+            except Exception as e:
+                logger.error(f"yt-dlp {download_type} attempt {attempt + 1} error: {str(e)}")
+                if attempt < 2:
+                    await asyncio.sleep(2 ** (attempt + 1))
+                    continue
+                if os.path.exists(path):
+                    os.remove(path)
+                DOWNLOAD_TASKS[path] = {"status": "failed", "url": url, "file_path": path, "error": str(e)}
+                return
     except Exception as e:
-        logger.error(f"yt-dlp error: {str(e)}")
+        logger.error(f"yt-dlp critical error: {str(e)}")
         if os.path.exists(path):
             os.remove(path)
-        DOWNLOAD_TASKS[path] = {"status": "failed", "url": url, "error": str(e)}
+        DOWNLOAD_TASKS[path] = {"status": "failed", "url": url, "file_path": path, "error": str(e)}
 
 # Spotify handler
 @cached(ttl=300, cache=Cache.MEMORY)
 async def handle_spotify(url: str, request: Request):
     async with aiohttp.ClientSession() as session:
         try:
-            # Fetch spotmate.online homepage
             async with session.get("https://spotmate.online", headers={
                 "User-Agent": "Mozilla/5.0",
                 "Accept": "text/html"
@@ -406,7 +429,6 @@ async def handle_spotify(url: str, request: Request):
                 soup = BeautifulSoup(html, "html.parser")
                 csrf_token = soup.find("meta", {"name": "csrf-token"})["content"]
 
-                # Extract session cookie
                 session_cookie = None
                 for cookie in resp.cookies.values():
                     if cookie.key == "spotmateonline_session":
@@ -416,7 +438,6 @@ async def handle_spotify(url: str, request: Request):
                     logger.error("No spotmateonline_session cookie")
                     raise HTTPException(500, "Missing session cookie")
 
-            # POST to convert endpoint
             async with session.post(
                 "https://spotmate.online/convert",
                 json={"urls": url},
@@ -430,7 +451,7 @@ async def handle_spotify(url: str, request: Request):
                     "sec-ch-ua-mobile": "?1",
                     "origin": "https://spotmate.online",
                     "sec-fetch-site": "same-origin",
-                    "sec-fetch-mode": "cors",
+                    "сек-fetch-mode": "cors",
                     "sec-fetch-dest": "empty",
                     "referer": "https://spotmate.online/en",
                     "accept-language": "en-US,en;q=0.9"
@@ -464,11 +485,12 @@ async def handle_spotify(url: str, request: Request):
                 "link": track_url,
                 "stream_mp4": None,
                 "stream_mp3": f"{base_url}/spotify/{track_hash}",
-                "file_name": filename
+                "file_name": filename,
+                "status_url": f"{base_url}/status/{filename}"
             }
 
             if not os.path.exists(file_path) and file_path not in DOWNLOAD_TASKS:
-                DOWNLOAD_TASKS[file_path] = {"status": "pending", "url": track_url}
+                DOWNLOAD_TASKS[file_path] = {"status": "pending", "url": track_url, "file_path": file_path}
                 asyncio.create_task(background_spotify_download(track_hash, track_url, file_path))
 
             logger.info(f"Spotify response: {response}")
@@ -482,6 +504,7 @@ async def handle_spotify(url: str, request: Request):
 async def stream_spotify(track_hash: str):
     track_data = SPOTIFY_DOWNLOAD_TASKS.get(track_hash)
     if not track_data:
+        logger.error(f"Track hash {track_hash} not found")
         raise HTTPException(404, "Track not found")
 
     file_path = track_data["file_path"]
@@ -490,37 +513,43 @@ async def stream_spotify(track_hash: str):
     if os.path.exists(file_path):
         file_age = time.time() - min(os.path.getmtime(file_path), os.path.getctime(file_path))
         if file_age > CACHE_DURATION:
+            logger.info(f"File expired: {file_path}")
             os.remove(file_path)
+            if file_path in DOWNLOAD_TASKS:
+                del DOWNLOAD_TASKS[file_path]
             raise HTTPException(404, "File expired")
+        logger.info(f"Streaming Spotify file: {file_path}")
         return FileResponse(file_path, media_type="audio/mpeg")
-    raise HTTPException(404, "File not available")
+    logger.error(f"File not found: {file_path}")
+    raise HTTPException(404, f"File not available. Check status at /status/{filename}")
 
 # Background Spotify download
 async def background_spotify_download(track_hash, track_url, file_path):
     try:
-        DOWNLOAD_TASKS[file_path] = {"status": "downloading", "url": track_url}
+        DOWNLOAD_TASKS[file_path] = {"status": "downloading", "url": track_url, "file_path": file_path}
         if os.path.exists(file_path) and time.time() - min(os.path.getmtime(file_path), os.path.getctime(file_path)) < CACHE_DURATION:
             logger.info(f"Skipping download: {file_path} exists")
-            DOWNLOAD_TASKS[file_path] = {"status": "completed", "url": track_url}
+            DOWNLOAD_TASKS[file_path] = {"status": "completed", "url": track_url, "file_path": file_path}
             return
 
         if await download_file(track_url, file_path):
             logger.info(f"Downloaded: {file_path}")
-            DOWNLOAD_TASKS[file_path] = {"status": "completed", "url": track_url}
+            DOWNLOAD_TASKS[file_path] = {"status": "completed", "url": track_url, "file_path": file_path}
         else:
             if os.path.exists(file_path):
                 os.remove(file_path)
-            DOWNLOAD_TASKS[file_path] = {"status": "failed", "url": track_url, "error": "Download failed"}
+            DOWNLOAD_TASKS[file_path] = {"status": "failed", "url": track_url, "file_path": file_path, "error": "Download failed"}
     except Exception as e:
         logger.error(f"Spotify download error: {str(e)}")
         if os.path.exists(file_path):
             os.remove(file_path)
-        DOWNLOAD_TASKS[file_path] = {"status": "failed", "url": track_url, "error": str(e)}
+        DOWNLOAD_TASKS[file_path] = {"status": "failed", "url": track_url, "file_path": file_path, "error": str(e)}
 
 # Instagram handler
 async def handle_instagram(url: str, request: Request, sound: bool = False, quality: str = None):
     info = await get_instagram_video_info(url)
     if not info or not info["video_url"]:
+        logger.error(f"Invalid Instagram URL or no video: {url}")
         raise HTTPException(400, "Invalid Instagram URL or no video")
 
     output_filename = get_unique_filename(url, quality if quality else "original", sound)
@@ -533,13 +562,15 @@ async def handle_instagram(url: str, request: Request, sound: bool = False, qual
         "link": info["video_url"],
         "stream_mp4": f"{base_url}/stream/{output_filename}" if not sound else None,
         "stream_mp3": f"{base_url}/stream/{output_filename}" if sound else None,
-        "file_name": output_filename
+        "file_name": output_filename,
+        "status_url": f"{base_url}/status/{output_filename}"
     }
 
     if not os.path.exists(output_path) and output_path not in DOWNLOAD_TASKS:
-        DOWNLOAD_TASKS[output_path] = {"status": "pending", "url": info["video_url"]}
+        DOWNLOAD_TASKS[output_path] = {"status": "pending", "url": info["video_url"], "file_path": output_path}
         asyncio.create_task(background_instagram_download(info["video_url"], output_path, sound, quality))
 
+    logger.info(f"Instagram response: {response}")
     return JSONResponse(response)
 
 # Background Instagram download
@@ -547,22 +578,22 @@ async def background_instagram_download(video_url, output_path, sound, quality):
     temp_filename = f"temp_instagram_{int(time.time())}.mp4"
     temp_path = os.path.join(DOWNLOAD_DIR, temp_filename)
     try:
-        DOWNLOAD_TASKS[output_path] = {"status": "downloading", "url": video_url}
+        DOWNLOAD_TASKS[output_path] = {"status": "downloading", "url": video_url, "file_path": output_path}
         if os.path.exists(output_path) and time.time() - min(os.path.getmtime(output_path), os.path.getctime(output_path)) < CACHE_DURATION:
             logger.info(f"Skipping download: {output_path} exists")
-            DOWNLOAD_TASKS[output_path] = {"status": "completed", "url": video_url}
+            DOWNLOAD_TASKS[output_path] = {"status": "completed", "url": video_url, "file_path": output_path}
             return
 
         if not await download_file(video_url, temp_path):
             logger.error(f"Failed to download Instagram video: {video_url}")
-            DOWNLOAD_TASKS[output_path] = {"status": "failed", "url": video_url, "error": "Download failed"}
+            DOWNLOAD_TASKS[output_path] = {"status": "failed", "url": video_url, "file_path": output_path, "error": "Download failed"}
             return
         if not await process_instagram_video(temp_path, output_path, sound, quality):
             logger.error(f"Failed to process Instagram video: {output_path}")
-            DOWNLOAD_TASKS[output_path] = {"status": "failed", "url": video_url, "error": "Processing failed"}
+            DOWNLOAD_TASKS[output_path] = {"status": "failed", "url": video_url, "file_path": output_path, "error": "Processing failed"}
             return
         logger.info(f"Completed Instagram download: {output_path}")
-        DOWNLOAD_TASKS[output_path] = {"status": "completed", "url": video_url}
+        DOWNLOAD_TASKS[output_path] = {"status": "completed", "url": video_url, "file_path": output_path}
     finally:
         if os.path.exists(temp_path):
             try:
@@ -575,9 +606,14 @@ async def background_instagram_download(video_url, output_path, sound, quality):
 @app.get("/stream/{filename}")
 async def stream_file(filename: str):
     file_path = os.path.join(DOWNLOAD_DIR, filename)
+    task = DOWNLOAD_TASKS.get(file_path)
+    if task and task["status"] in ["pending", "downloading"]:
+        logger.info(f"File {filename} is still downloading")
+        raise HTTPException(425, f"File is still downloading. Check status at /status/{filename}")
     if os.path.exists(file_path):
         file_age = time.time() - min(os.path.getmtime(file_path), os.path.getctime(file_path))
         if file_age > CACHE_DURATION:
+            logger.info(f"File expired: {file_path}")
             os.remove(file_path)
             if file_path in DOWNLOAD_TASKS:
                 del DOWNLOAD_TASKS[file_path]
@@ -589,8 +625,26 @@ async def stream_file(filename: str):
             "avi": "video/x-msvideo",
             "mp3": "audio/mpeg"
         }.get(ext, "application/octet-stream")
+        logger.info(f"Streaming file: {file_path}")
         return FileResponse(file_path, media_type=content_type)
-    raise HTTPException(404, "File not available")
+    logger.error(f"File not found: {file_path}")
+    raise HTTPException(404, f"File not available. Check status at /status/{filename}")
+
+# Status checking endpoint
+@app.get("/status/{filename}")
+async def check_status(filename: str):
+    file_path = os.path.join(DOWNLOAD_DIR, filename)
+    task = DOWNLOAD_TASKS.get(file_path)
+    if not task:
+        logger.error(f"No task found for {filename}")
+        raise HTTPException(404, "No download task found for this file")
+    return JSONResponse({
+        "filename": filename,
+        "status": task["status"],
+        "url": task["url"],
+        "error": task.get("error"),
+        "file_path": task["file_path"] if task["status"] == "completed" else None
+    })
 
 if __name__ == "__main__":
     import uvicorn
