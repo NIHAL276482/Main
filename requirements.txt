@@ -1,0 +1,15 @@
+fastapi
+uvicorn
+aiohttp
+aiofiles 
+instaloader
+python-multipart
+aiocache
+bs4
+TeraboxDL
+werkzeug
+yt-dlp 
+ffmpeg-python
+requests
+soupsieve
+urllib3
