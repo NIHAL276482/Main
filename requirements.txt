@@ -6,7 +6,7 @@ instaloader
 python-multipart
 aiocache
 bs4
-TeraboxDL
+terabox-downlaoder==1.8
 werkzeug
 yt-dlp 
 ffmpeg-python
