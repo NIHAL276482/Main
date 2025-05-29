@@ -17,19 +17,21 @@ import instaloader
 from werkzeug.utils import secure_filename
 from urllib.parse import urlparse, urlunparse
 import uuid
+import re
 
 app = FastAPI()
 DOWNLOAD_DIR = "downloads"
 CACHE_DURATION = 43200  # 12 hours
 TERABOX_LINKS = {}
-DOWNLOAD_TASKS = {}  # Tracks all download tasks
+DOWNLOAD_TASKS = {}
 SPOTIFY_DOWNLOAD_TASKS = {}
 COOKIES_FILE = "cookies.txt"
 API_KEY = "spotify"
+INSTAGRAM_CREDENTIALS = "instagram_credentials.json"
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-# Configure logging with DEBUG level
+# Configure logging
 logging.basicConfig(
     level=logging.DEBUG,
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -111,9 +113,9 @@ def is_instagram_url(url):
 def is_youtube_url(url): 
     return url and ("youtube.com" in url.lower() or "youtu.be" in url.lower() or "googlevideo.com" in url.lower())
 def is_yt_dlp_supported(url): 
-    return True
+    return True  # yt-dlp supports many platforms
 
-# Generate unique filename
+# Generate unique filename (for non-YouTube)
 def get_unique_filename(url, quality=None, sound=False):
     base_identifier = f"{url}_{quality or 'best'}_{'sound' if sound else 'video'}"
     file_path = None
@@ -146,58 +148,24 @@ def validate_cookies_file():
             if not content:
                 logger.error(f"cookies.txt at {COOKIES_FILE} is empty.")
                 return False
-            if not any(line.startswith("youtube.com") for line in content.splitlines()):
-                logger.warning(f"cookies.txt at {COOKIES_FILE} lacks YouTube cookies.")
-            logger.debug(f"Valid cookies.txt found at {COOKIES_FILE} with content length: {len(content)}")
+            logger.debug(f"Valid cookies.txt found at {COOKIES_FILE}")
             return True
     except IOError as e:
         logger.error(f"Failed to read cookies.txt at {COOKIES_FILE}: {e}")
         return False
 
-# Generic metadata extraction using yt-dlp
-@lru_cache(maxsize=100)
-def get_yt_dlp_metadata(url):
-    if not check_yt_dlp():
-        logger.error("Cannot fetch metadata: yt-dlp is not available")
-        return {"title": "Unknown Title", "thumbnail": None}
-    
-    cookie_option = f"--cookies {COOKIES_FILE}" if validate_cookies_file() else ""
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            cmd = f'yt-dlp --dump-json {cookie_option} --no-playlist --no-check-certificate --retries 3 "{url}"'
-            logger.debug(f"Executing yt-dlp metadata command (attempt {attempt + 1}/{max_retries}): {cmd}")
-            process = subprocess.run(
-                cmd, shell=True, text=True, capture_output=True, timeout=30
-            )
-            if process.returncode != 0:
-                logger.error(f"yt-dlp metadata failed (attempt {attempt + 1}/{max_retries}): {process.stderr}")
-                if "Sign in to confirm you’re not a bot" in process.stderr:
-                    raise HTTPException(
-                        status_code=403,
-                        detail="Authentication required. Please update cookies.txt with valid YouTube cookies."
-                    )
-                if attempt == max_retries - 1:
-                    logger.error(f"Exhausted retries for {url}. Returning fallback metadata.")
-                    return {"title": "Unknown Title", "thumbnail": None}
-                time.sleep(2 ** (attempt + 1))
-                continue
-            data = json.loads(process.stdout)
-            title = data.get("title", "Unknown Title")
-            thumbnail = data.get("thumbnail") or next((t["url"] for t in data.get("thumbnails", []) if t.get("url")), None)
-            logger.debug(f"Metadata for {url}: title={title}, thumbnail={thumbnail}")
-            return {"title": title, "thumbnail": thumbnail}
-        except subprocess.TimeoutExpired as e:
-            logger.error(f"yt-dlp timed out for {url} (attempt {attempt + 1}/{max_retries}): {e}")
-            if attempt == max_retries - 1:
-                return {"title": "Unknown Title", "thumbnail": None}
-            time.sleep(2 ** (attempt + 1))
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse yt-dlp JSON for {url}: {e}")
-            return {"title": "Unknown Title", "thumbnail": None}
-        except Exception as e:
-            logger.error(f"Unexpected error fetching metadata for {url}: {e}")
-            return {"title": "Unknown Title", "thumbnail": None}
+# Extract YouTube video ID
+def extract_youtube_id(url):
+    patterns = [
+        r"(?:youtube\.com/watch\?v=|youtu\.be/)([A-Za-z0-9_-]+)",
+        r"youtube\.com/.*[?&]v=([A-Za-z0-9_-]+)",
+        r"youtu\.be/([A-Za-z0-9_-]+)"
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    return None
 
 # File download utility
 async def download_file(url, path):
@@ -216,66 +184,55 @@ async def download_file(url, path):
             logger.error(f"Error downloading file {url}: {e}")
             return False
 
-# Instagram video URL and title extraction with retries
+# Instagram video URL and title extraction
 async def get_instagram_video_info(post_url):
     def sync_get_instagram_info():
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                L = instaloader.Instaloader()
-                # Optional: Add Instagram login for private accounts or to bypass rate limits
-                username = os.getenv("INSTAGRAM_USERNAME")
-                password = os.getenv("INSTAGRAM_PASSWORD")
-                if username and password:
-                    try:
-                        L.login(username, password)
-                        logger.info(f"Logged into Instagram as {username}")
-                    except Exception as e:
-                        logger.warning(f"Instagram login failed: {e}")
-                
-                # Validate URL
-                if not is_instagram_url(post_url) or "/p/" not in post_url:
-                    logger.error(f"Invalid Instagram URL: {post_url}")
+        try:
+            L = instaloader.Instaloader()
+            if os.path.exists(INSTAGRAM_CREDENTIALS):
+                try:
+                    with open(INSTAGRAM_CREDENTIALS, "r") as f:
+                        creds = json.load(f)
+                        username = creds.get("username")
+                        password = creds.get("password")
+                        if username and password:
+                            L.login(username, password)
+                            logger.info(f"Logged into Instagram as {username}")
+                except Exception as e:
+                    logger.warning(f"Failed to load Instagram credentials: {e}")
+            shortcode_pattern = r'(?:/p/|/reel/|/tv/)([A-Za-z0-9_-]+)'
+            match = re.search(shortcode_pattern, post_url)
+            if not match:
+                logger.error(f"Could not extract shortcode from URL: {post_url}")
+                return None
+            shortcode = match.group(1)
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    post = instaloader.Post.from_shortcode(L.context, shortcode)
+                    if not post.is_video:
+                        logger.error(f"Post {shortcode} is not a video")
+                        return None
+                    return {
+                        "video_url": post.video_url,
+                        "title": post.caption or f"Instagram_{shortcode}",
+                        "thumbnail": post.url
+                    }
+                except instaloader.exceptions.LoginRequiredException:
+                    logger.error(f"Login required for Instagram post {shortcode}")
                     return None
-                
-                shortcode = post_url.split("/")[-2]
-                if not shortcode:
-                    logger.error(f"Could not extract shortcode from URL: {post_url}")
+                except instaloader.exceptions.InstaloaderException as e:
+                    logger.error(f"Attempt {attempt + 1}/{max_retries} failed for {shortcode}: {e}")
+                    if attempt < max_retries - 1:
+                        time.sleep(2 ** (attempt + 1))
+                        continue
                     return None
-                
-                post = instaloader.Post.from_shortcode(L.context, shortcode)
-                if not post.is_video:
-                    logger.error(f"Instagram post is not a video: {post_url}")
-                    return None
-                
-                return {
-                    "video_url": post.video_url,
-                    "title": post.caption or f"Instagram_{shortcode}",
-                    "thumbnail": post.url
-                }
-            except instaloader.exceptions.BadCredentialsException as e:
-                logger.error(f"Instagram authentication failed: {e}")
-                return None
-            except instaloader.exceptions.InvalidArgumentException as e:
-                logger.error(f"Invalid Instagram shortcode: {e}")
-                return None
-            except instaloader.exceptions.ConnectionException as e:
-                logger.error(f"Instagram connection error (attempt {attempt + 1}/{max_retries}): {e}")
-                if attempt < max_retries - 1:
-                    time.sleep(2 ** (attempt + 1))
-                    continue
-                return None
-            except Exception as e:
-                logger.error(f"Error fetching Instagram info (attempt {attempt + 1}/{max_retries}): {e}")
-                if attempt < max_retries - 1:
-                    time.sleep(2 ** (attempt + 1))
-                    continue
-                return None
-        logger.error(f"Failed to fetch Instagram info after {max_retries} attempts for URL: {post_url}")
-        return None
+        except Exception as e:
+            logger.error(f"Unexpected error fetching Instagram info for {post_url}: {e}")
+            return None
     return await asyncio.get_event_loop().run_in_executor(executor, sync_get_instagram_info)
 
-# Instagram video processing using ffmpeg
+# Instagram video processing
 async def process_instagram_video(temp_path, output_path, sound=False, quality=None):
     if not check_ffmpeg():
         logger.error("Cannot process Instagram video: ffmpeg is not available")
@@ -307,6 +264,45 @@ async def process_instagram_video(temp_path, output_path, sound=False, quality=N
         logger.error(f"Error processing Instagram video: {e}")
         return False
 
+# Metadata extraction for non-YouTube
+@lru_cache(maxsize=100)
+def get_yt_dlp_metadata(url):
+    if not check_yt_dlp():
+        logger.error("Cannot fetch metadata: yt-dlp is not available")
+        return {"title": "Unknown Title", "thumbnail": None}
+    
+    cookie_option = f"--cookies {COOKIES_FILE}" if validate_cookies_file() else ""
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            cmd = f'yt-dlp --dump-json {cookie_option} --no-playlist --no-check-certificate --retries 3 "{url}"'
+            logger.debug(f"Executing yt-dlp metadata command (attempt {attempt + 1}/{max_retries}): {cmd}")
+            process = subprocess.run(
+                cmd, shell=True, text=True, capture_output=True, timeout=30
+            )
+            if process.returncode != 0:
+                logger.error(f"yt-dlp metadata failed (attempt {attempt + 1}/{max_retries}): {process.stderr}")
+                if attempt == max_retries - 1:
+                    return {"title": "Unknown Title", "thumbnail": None}
+                time.sleep(2 ** (attempt + 1))
+                continue
+            data = json.loads(process.stdout)
+            title = data.get("title", "Unknown Title")
+            thumbnail = data.get("thumbnail") or next((t["url"] for t in data.get("thumbnails", []) if t.get("url")), None)
+            logger.debug(f"Metadata for {url}: title={title}, thumbnail={thumbnail}")
+            return {"title": title, "thumbnail": thumbnail}
+        except subprocess.TimeoutExpired as e:
+            logger.error(f"yt-dlp timed out for {url} (attempt {attempt + 1}/{max_retries}): {e}")
+            if attempt == max_retries - 1:
+                return {"title": "Unknown Title", "thumbnail": None}
+            time.sleep(2 ** (attempt + 1))
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse yt-dlp JSON for {url}: {e}")
+            return {"title": "Unknown Title", "thumbnail": None}
+        except Exception as e:
+            logger.error(f"Unexpected error fetching metadata for {url}: {e}")
+            return {"title": "Unknown Title", "thumbnail": None}
+
 # Main endpoint
 @app.get("/")
 async def download_video(request: Request):
@@ -325,11 +321,6 @@ async def download_video(request: Request):
 
     api_key = request.headers.get("X-API-Key")
     is_authenticated = api_key == API_KEY
-    if is_authenticated:
-        logger.info("Authenticated request with X-API-Key 'spotify'")
-    else:
-        logger.info("Unauthenticated request (no or invalid X-API-Key)")
-
     logger.info(f"Received request for url: {url}, sound: {sound}, quality: {quality}, authenticated: {is_authenticated}")
 
     if is_spotify_url(url):
@@ -344,41 +335,74 @@ async def download_video(request: Request):
         return await handle_terabox(url, request, is_authenticated)
     elif is_instagram_url(url):
         return await handle_instagram(url, request, sound, quality, is_authenticated)
+    elif is_youtube_url(url):
+        return await handle_youtube_vatis(url, request, sound, quality, is_authenticated)
     elif is_yt_dlp_supported(url):
         if not check_yt_dlp():
             logger.error("yt-dlp is not available for processing")
             raise HTTPException(status_code=500, detail="yt-dlp is not installed or not in PATH")
-        platform = "youtube" if is_youtube_url(url) else "generic"
-        return await handle_yt_dlp(url, request, sound, quality, platform=platform, is_authenticated=is_authenticated)
+        return await handle_yt_dlp(url, request, sound, quality, platform="generic", is_authenticated=is_authenticated)
     else:
         logger.error(f"Unsupported URL type: {url}")
         raise HTTPException(status_code=400, detail=f"Unsupported URL type: {url}")
 
-# New YouTube ID endpoint
+# YouTube-specific endpoint
 @app.get("/yt")
-async def download_youtube_by_id(request: Request):
-    video_id = request.query_params.get("id")
-    if not video_id:
-        logger.error("No video ID provided in request")
-        raise HTTPException(status_code=400, detail="Video ID parameter is required")
+async def download_youtube_by_id(request: Request, id: str):
+    if not id:
+        logger.error("No YouTube video ID provided")
+        raise HTTPException(status_code=400, detail="YouTube video ID is required")
 
-    # Validate video ID (basic check for YouTube ID format: 11 characters, alphanumeric, and special chars)
-    if not (8 <= len(video_id) <= 12 and all(c.isalnum() or c in "-_" for c in video_id)):
-        logger.error(f"Invalid YouTube video ID: {video_id}")
+    if not re.match(r'^[A-Za-z0-9_-]+$', id):
+        logger.error(f"Invalid YouTube video ID: {id}")
         raise HTTPException(status_code=400, detail="Invalid YouTube video ID")
 
-    # Construct YouTube URL
-    url = f"https://youtu.be/{video_id}"
-    logger.info(f"Constructed YouTube URL from ID {video_id}: {url}")
+    url = f"https://youtu.be/{id}"
+    logger.info(f"Constructed YouTube URL: {url}")
 
-    # Always request both video and audio, default to 1080p for video
-    return await handle_yt_dlp(url, request, sound=False, quality="1080", platform="youtube", is_authenticated=False)
+    api_key = request.headers.get("X-API-Key")
+    is_authenticated = api_key == API_KEY
+    return await handle_youtube_vatis(url, request, sound=False, quality=None, is_authenticated=is_authenticated)
 
-# Generic yt-dlp handler
-async def handle_yt_dlp(url: str, request: Request, sound: bool = False, quality: str = None, platform: str = "generic", is_authenticated: bool = False):
-    logger.info(f"Handling {platform} URL: {url}, authenticated: {is_authenticated}")
+# YouTube handler using Vatis API
+async def handle_youtube_vatis(url: str, request: Request, sound: bool = False, quality: str = None, is_authenticated: bool = False):
+    logger.info(f"Handling YouTube URL: {url}, authenticated: {is_authenticated}")
     if is_youtube_url(url):
         url = clean_youtube_url(url)
+
+    video_id = extract_youtube_id(url)
+    if not video_id:
+        logger.error(f"Could not extract YouTube video ID from URL: {url}")
+        raise HTTPException(status_code=400, detail="Invalid YouTube URL")
+
+    vatis_url = f"https://vatis.tech/app/api/youtube-downloader?url={url}"
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+        try:
+            logger.info(f"Fetching from Vatis API: {vatis_url}")
+            async with session.get(vatis_url) as response:
+                if response.status != 200:
+                    logger.error(f"Vatis API returned status {response.status}")
+                    raise HTTPException(status_code=response.status, detail="Failed to fetch YouTube URLs")
+                data = await response.json()
+                if not data.get("videoUrl") and not data.get("audioUrl"):
+                    logger.error(f"Vatis API returned no URLs: {data}")
+                    raise HTTPException(status_code=500, detail="No video or audio URLs provided by API")
+                
+                response = {
+                    "videoUrl": data.get("videoUrl") if not sound else None,
+                    "audioUrl": data.get("audioUrl") if sound or not quality else None,
+                    "title": data.get("title", "Unknown Title"),
+                    "videoId": video_id
+                }
+                logger.info(f"YouTube response: {response}")
+                return JSONResponse(response)
+        except aiohttp.ClientError as e:
+            logger.error(f"Vatis API request failed: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to fetch YouTube URLs: {str(e)}")
+
+# Non-YouTube yt-dlp handler
+async def handle_yt_dlp(url: str, request: Request, sound: bool = False, quality: str = None, platform: str = "generic", is_authenticated: bool = False):
+    logger.info(f"Handling {platform} URL: {url}, authenticated: {is_authenticated}")
     metadata = get_yt_dlp_metadata(url)
 
     video_filename = audio_filename = None
@@ -462,59 +486,74 @@ async def background_yt_dlp_download(url, path, download_type, quality=None, coo
             logger.info(f"Removed partial file: {path} (outside cache duration)")
         DOWNLOAD_TASKS[path] = {"status": "failed", "url": url, "error": str(e)}
 
-# Terabox handler
-@cached(ttl=300, cache=Cache.MEMORY)
-async def handle_terabox(url: str, request: Request, is_authenticated: bool):
-    api_url = f"https://tb.hosters.club/?url={url}"
-    max_retries = 3
-    retry_status_codes = [400, 404, 405, 504]
-    for attempt in range(max_retries):
-        try:
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
-                logger.info(f"Attempt {attempt + 1}/{max_retries} to fetch Terabox API: {api_url}")
-                async with session.get(api_url) as response:
-                    response_text = await response.text()
-                    logger.info(f"Terabox API response status: {response.status}")
-                    if response.status == 200:
-                        data = await response.json()
-                        direct_link = data.get("direct_link")
-                        if direct_link:
-                            link_hash = base64.urlsafe_b64encode(hashlib.md5(direct_link.encode()).digest()).decode()[:24]
-                            filename = data.get("name", f"terabox_{link_hash}.mp4")
-                            file_path = os.path.join(DOWNLOAD_DIR, filename)
-                            TERABOX_LINKS[link_hash] = {
-                                "link": direct_link,
-                                "name": filename
-                            }
-                            base_url = str(request.base_url).rstrip('/')
-                            response_data = {
-                                "title": data.get("name", "Terabox Video"),
-                                "thumbnail": data.get("thumbnail"),
-                                "link": direct_link,
-                                "stream_mp4": f"{base_url}/tb/{link_hash}",
-                                "stream_mp3": None,
-                                "file_name": filename
-                            }
-                            if not os.path.exists(file_path) and file_path not in DOWNLOAD_TASKS:
-                                DOWNLOAD_TASKS[file_path] = {"status": "pending", "url": direct_link}
-                                asyncio.create_task(background_download(link_hash, direct_link, file_path))
-                            logger.info(f"Terabox response: {response_data}")
-                            return JSONResponse(response_data)
-                        logger.error("No direct_link provided in Terabox API response")
-                        raise HTTPException(status_code=500, detail="No direct_link provided")
-                    elif response.status in retry_status_codes and attempt < max_retries - 1:
-                        logger.warning(f"Terabox API returned {response.status}, retrying...")
-                        await asyncio.sleep(2 ** (attempt + 1))
-                        continue
-                    logger.error(f"Terabox API returned status {response.status}: {response_text}")
-                    raise HTTPException(status_code=response.status, detail=f"Terabox API error: {response_text}")
-        except aiohttp.ClientError as e:
-            logger.error(f"Terabox API request failed on attempt {attempt + 1}: {e}")
-            if attempt == max_retries - 1:
-                raise HTTPException(status_code=500, detail=f"Terabox API failed after {max_retries} attempts: {str(e)}")
-            await asyncio.sleep(2 ** (attempt + 1))
-    logger.error(f"Failed to fetch Terabox data after {max_retries} attempts for URL: {url}")
-    raise HTTPException(status_code=500, detail=f"Failed to fetch Terabox data after {max_retries} attempts")
+# Instagram handler
+async def handle_instagram(url: str, request: Request, sound: bool = False, quality: str = None, is_authenticated: bool = False):
+    logger.info(f"Handling Instagram URL: {url}, authenticated: {is_authenticated}")
+    info = await get_instagram_video_info(url)
+    if not info or not info["video_url"]:
+        logger.error(f"Invalid Instagram URL or no video found: {url}")
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid Instagram URL or no video found. Ensure the URL points to a public video or provide valid credentials."
+        )
+
+    output_filename = get_unique_filename(url, quality if quality else "original", sound)
+    output_path = os.path.join(DOWNLOAD_DIR, output_filename)
+
+    base_url = str(request.base_url).rstrip('/')
+    response = {
+        "title": info["title"],
+        "thumbnail": info["thumbnail"],
+        "link": info["video_url"],
+        "stream_mp4": f"{base_url}/stream/{output_filename}" if not sound else None,
+        "stream_mp3": f"{base_url}/stream/{output_filename}" if sound else None,
+        "file_name_mp4": output_filename if not sound else None,
+        "file_name_mp3": output_filename if sound else None
+    }
+
+    if not os.path.exists(output_path) and output_path not in DOWNLOAD_TASKS:
+        DOWNLOAD_TASKS[output_path] = {"status": "pending", "url": info["video_url"]}
+        asyncio.create_task(background_instagram_download(info["video_url"], output_path, sound, quality))
+
+    logger.info(f"Instagram response: {response}")
+    return JSONResponse(response)
+
+# Background download for Instagram
+async def background_instagram_download(video_url, output_path, sound, quality):
+    temp_filename = f"temp_instagram_{int(time.time())}.mp4"
+    temp_path = os.path.join(DOWNLOAD_DIR, temp_filename)
+    try:
+        DOWNLOAD_TASKS[output_path] = {"status": "downloading", "url": video_url}
+        if os.path.exists(output_path):
+            file_age = time.time() - min(os.path.getmtime(output_path), os.path.getctime(output_path))
+            if file_age < CACHE_DURATION:
+                logger.info(f"Skipping download for {output_path}: File exists and is within cache duration ({file_age:.2f} seconds)")
+                DOWNLOAD_TASKS[output_path] = {"status": "completed", "url": video_url}
+                return
+
+        if not await download_file(video_url, temp_path):
+            logger.error(f"Failed to download Instagram video: {video_url}")
+            DOWNLOAD_TASKS[output_path] = {"status": "failed", "url": video_url, "error": "Download failed"}
+            return
+        if not await process_instagram_video(temp_path, output_path, sound, quality):
+            logger.error(f"Failed to process Instagram video: {output_path}")
+            DOWNLOAD_TASKS[output_path] = {"status": "failed", "url": video_url, "error": "Processing failed"}
+            return
+        logger.info(f"Completed background Instagram download: {output_path}")
+        DOWNLOAD_TASKS[output_path] = {"status": "completed", "url": video_url}
+    except Exception as e:
+        logger.error(f"Background Instagram download error: {e}")
+        if os.path.exists(output_path) and (time.time() - min(os.path.getmtime(output_path), os.path.getctime(output_path))) > CACHE_DURATION:
+            os.remove(output_path)
+            logger.info(f"Removed partial file: {output_path} (outside cache duration)")
+        DOWNLOAD_TASKS[output_path] = {"status": "failed", "url": video_url, "error": str(e)}
+    finally:
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+                logger.info(f"Removed temp file: {temp_path}")
+            except OSError:
+                logger.error(f"Failed to remove temp file {temp_path}")
 
 # Spotify handler
 @cached(ttl=300, cache=Cache.MEMORY)
@@ -528,7 +567,7 @@ async def handle_spotify(url: str, request: Request, is_authenticated: bool):
                 logger.info(f"Attempt {attempt + 1}/{max_retries} to fetch Spotify API: {api_url}")
                 async with session.get(api_url) as response:
                     response_text = await response.text()
-                    logger.info(f"Spotify API response status: {response.status}, body: {response_text[:500]}...")
+                    logger.info(f"Spotify API response status: {response.status}")
                     if response.status == 200:
                         data = await response.json()
                         if not data.get("error", True) and data.get("url"):
@@ -551,7 +590,8 @@ async def handle_spotify(url: str, request: Request, is_authenticated: bool):
                                 "link": track_url,
                                 "stream_mp4": None,
                                 "stream_mp3": f"{base_url}/spotify/{track_hash}",
-                                "file_name": filename
+                                "file_name_mp4": None,
+                                "file_name_mp3": filename
                             }
 
                             if not os.path.exists(file_path) and file_path not in DOWNLOAD_TASKS:
@@ -565,7 +605,7 @@ async def handle_spotify(url: str, request: Request, is_authenticated: bool):
                         logger.warning(f"Spotify API returned {response.status} on attempt {attempt + 1}, retrying...")
                         await asyncio.sleep(2 ** (attempt + 1))
                         continue
-                    logger.error(f"Spotify API returned status {response.status}: {response_text[:500]}...")
+                    logger.error(f"Spotify API returned status {response.status}: {response_text}")
                     raise HTTPException(status_code=response.status, detail=f"Spotify API returned status {response.status}")
         except aiohttp.ClientError as e:
             logger.error(f"Spotify API request failed on attempt {attempt + 1}: {e}")
@@ -636,70 +676,129 @@ async def background_spotify_download(track_hash, track_url, file_path):
         DOWNLOAD_TASKS[file_path] = {"status": "failed", "url": track_url, "error": str(e)}
         logger.error(f"Background download error for {track_url}: {e}")
 
-# Instagram handler
-async def handle_instagram(url: str, request: Request, sound: bool = False, quality: str = None, is_authenticated: bool = False):
-    logger.info(f"Handling Instagram URL: {url}, authenticated: {is_authenticated}")
-    info = await get_instagram_video_info(url)
-    if not info or not info["video_url"]:
-        logger.error(f"Invalid Instagram URL or no video found: {url}")
-        raise HTTPException(status_code=400, detail="Invalid Instagram URL or no video found")
+# Terabox handler
+@cached(ttl=300, cache=Cache.MEMORY)
+async def handle_terabox(url: str, request: Request, is_authenticated: bool):
+    api_url = f"https://tb.hosters.club/?url={url}"
+    max_retries = 3
+    retry_status_codes = [400, 404, 405, 504]
+    for attempt in range(max_retries):
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+                logger.info(f"Attempt {attempt + 1}/{max_retries} to fetch Terabox API: {api_url}")
+                async with session.get(api_url) as response:
+                    response_text = await response.text()
+                    logger.info(f"Terabox API response status: {response.status}")
+                    if response.status == 200:
+                        data = await response.json()
+                        direct_link = data.get("direct_link")
+                        if direct_link:
+                            link_hash = base64.urlsafe_b64encode(hashlib.md5(direct_link.encode()).digest()).decode()[:24]
+                            filename = data.get("name", f"terabox_{link_hash}.mp4")
+                            file_path = os.path.join(DOWNLOAD_DIR, filename)
+                            TERABOX_LINKS[link_hash] = {
+                                "link": direct_link,
+                                "name": filename
+                            }
+                            base_url = str(request.base_url).rstrip('/')
+                            response_data = {
+                                "title": data.get("name", "Terabox Video"),
+                                "thumbnail": data.get("thumbnail"),
+                                "link": direct_link,
+                                "stream_mp4": f"{base_url}/tb/{link_hash}",
+                                "stream_mp3": None,
+                                "file_name_mp4": filename,
+                                "file_name_mp3": None
+                            }
+                            if not os.path.exists(file_path) and file_path not in DOWNLOAD_TASKS:
+                                DOWNLOAD_TASKS[file_path] = {"status": "pending", "url": direct_link}
+                                asyncio.create_task(background_download(link_hash, direct_link, file_path))
+                            logger.info(f"Terabox response: {response_data}")
+                            return JSONResponse(response_data)
+                        logger.error("No direct_link provided in Terabox API response")
+                        raise HTTPException(status_code=500, detail="No direct_link provided")
+                    elif response.status in retry_status_codes and attempt < max_retries - 1:
+                        logger.warning(f"Terabox API returned {response.status}, retrying...")
+                        await asyncio.sleep(2 ** (attempt + 1))
+                        continue
+                    logger.error(f"Terabox API returned status {response.status}: {response_text}")
+                    raise HTTPException(status_code=response.status, detail=f"Terabox API error: {response_text}")
+        except aiohttp.ClientError as e:
+            logger.error(f"Terabox API request failed on attempt {attempt + 1}: {e}")
+            if attempt == max_retries - 1:
+                raise HTTPException(status_code=500, detail=f"Terabox API failed after {max_retries} attempts: {str(e)}")
+            await asyncio.sleep(2 ** (attempt + 1))
+    logger.error(f"Failed to fetch Terabox data after {max_retries} attempts for URL: {url}")
+    raise HTTPException(status_code=500, detail=f"Failed to fetch Terabox data after {max_retries} attempts")
 
-    output_filename = get_unique_filename(url, quality if quality else "original", sound)
-    output_path = os.path.join(DOWNLOAD_DIR, output_filename)
+# Terabox streaming
+@app.get("/tb/{link_hash}")
+async def stream_terabox(link_hash: str, request: Request):
+    link_data = TERABOX_LINKS.get(link_hash)
+    if not link_data:
+        logger.error(f"Terabox link not found for hash: {link_hash}")
+        raise HTTPException(status_code=404, detail="Link not found")
 
-    base_url = str(request.base_url).rstrip('/')
-    response = {
-        "title": info["title"],
-        "thumbnail": info["thumbnail"],
-        "link": info["video_url"],
-        "stream_mp4": f"{base_url}/stream/{output_filename}" if not sound else None,
-        "stream_mp3": f"{base_url}/stream/{output_filename}" if sound else None,
-        "file_name": output_filename
-    }
+    filename = link_data["name"]
+    file_path = os.path.join(DOWNLOAD_DIR, filename)
 
-    if not os.path.exists(output_path) and output_path not in DOWNLOAD_TASKS:
-        DOWNLOAD_TASKS[output_path] = {"status": "pending", "url": info["video_url"]}
-        asyncio.create_task(background_instagram_download(info["video_url"], output_path, sound, quality))
+    if os.path.exists(file_path):
+        now = time.time()
+        mtime = os.path.getmtime(file_path)
+        ctime = os.path.getctime(file_path)
+        file_age = now - min(mtime, ctime)
+        logger.debug(f"Streaming Terabox file {file_path}: now={now}, mtime={mtime}, ctime={ctime}, age={file_age:.2f} seconds")
+        if file_age > CACHE_DURATION or file_age < -3600:
+            logger.warning(f"File {file_path} has invalid age ({file_age:.2f} seconds), checking DOWNLOAD_TASKS")
+            if file_path in DOWNLOAD_TASKS and DOWNLOAD_TASKS[file_path]["status"] == "completed":
+                logger.info(f"File {file_path} is marked as completed in DOWNLOAD_TASKS, serving anyway")
+            else:
+                logger.warning(f"File {file_path} is older than cache duration ({file_age:.2f} seconds), removing")
+                os.remove(file_path)
+                if file_path in DOWNLOAD_TASKS:
+                    del DOWNLOAD_TASKS[file_path]
+                    logger.debug(f"Cleared expired task for {file_path} from DOWNLOAD_TASKS")
+                raise HTTPException(status_code=404, detail="File no longer available (expired)")
+        ext = filename.rsplit(".", 1)[-1].lower()
+        content_type = {
+            "mp4": "video/mp4",
+            "mkv": "video/x-matroska",
+            "avi": "video/x-msvideo",
+            "mp3": "audio/mpeg"
+        }.get(ext, "application/octet-stream")
+        logger.info(f"Serving existing Terabox file: {file_path}")
+        return FileResponse(file_path, media_type=content_type)
 
-    logger.info(f"Instagram response: {response}")
-    return JSONResponse(response)
+    logger.error(f"Terabox file not yet available: {file_path}")
+    raise HTTPException(status_code=404, detail="File not yet available")
 
-# Background download for Instagram
-async def background_instagram_download(video_url, output_path, sound, quality):
-    temp_filename = f"temp_instagram_{int(time.time())}.mp4"
-    temp_path = os.path.join(DOWNLOAD_DIR, temp_filename)
+# Background download for Terabox
+async def background_download(link_hash, link, file_path):
     try:
-        DOWNLOAD_TASKS[output_path] = {"status": "downloading", "url": video_url}
-        if os.path.exists(output_path):
-            file_age = time.time() - min(os.path.getmtime(output_path), os.path.getctime(output_path))
+        DOWNLOAD_TASKS[file_path] = {"status": "downloading", "url": link}
+        if os.path.exists(file_path):
+            file_age = time.time() - min(os.path.getmtime(file_path), os.path.getctime(file_path))
             if file_age < CACHE_DURATION:
-                logger.info(f"Skipping download for {output_path}: File exists and is within cache duration ({file_age:.2f} seconds)")
-                DOWNLOAD_TASKS[output_path] = {"status": "completed", "url": video_url}
+                logger.info(f"Skipping download for {file_path}: File exists and is within cache duration ({file_age:.2f} seconds)")
+                DOWNLOAD_TASKS[file_path] = {"status": "completed", "url": link}
                 return
 
-        if not await download_file(video_url, temp_path):
-            logger.error(f"Failed to download Instagram video: {video_url}")
-            DOWNLOAD_TASKS[output_path] = {"status": "failed", "url": video_url, "error": "Download failed"}
-            return
-        if not await process_instagram_video(temp_path, output_path, sound, quality):
-            logger.error(f"Failed to process Instagram video: {output_path}")
-            DOWNLOAD_TASKS[output_path] = {"status": "failed", "url": video_url, "error": "Processing failed"}
-            return
-        logger.info(f"Completed background Instagram download: {output_path}")
-        DOWNLOAD_TASKS[output_path] = {"status": "completed", "url": video_url}
+        logger.info(f"Started background download for {link}")
+        if await download_file(link, file_path):
+            logger.info(f"Completed background download for {file_path}")
+            DOWNLOAD_TASKS[file_path] = {"status": "completed", "url": link}
+        else:
+            if os.path.exists(file_path) and (time.time() - min(os.path.getmtime(file_path), os.path.getctime(file_path))) > CACHE_DURATION:
+                os.remove(file_path)
+                logger.info(f"Removed partial file: {file_path} (outside cache duration)")
+            DOWNLOAD_TASKS[file_path] = {"status": "failed", "url": link, "error": "Download failed"}
+            logger.error(f"Background download failed for {link}")
     except Exception as e:
-        logger.error(f"Background Instagram download error: {e}")
-        if os.path.exists(output_path) and (time.time() - min(os.path.getmtime(output_path), os.path.getctime(output_path))) > CACHE_DURATION:
-            os.remove(output_path)
-            logger.info(f"Removed partial file: {output_path} (outside cache duration)")
-        DOWNLOAD_TASKS[output_path] = {"status": "failed", "url": video_url, "error": str(e)}
-    finally:
-        if os.path.exists(temp_path):
-            try:
-                os.remove(temp_path)
-                logger.info(f"Removed temp file: {temp_path}")
-            except OSError:
-                logger.error(f"Failed to remove temp file {temp_path}")
+        if os.path.exists(file_path) and (time.time() - min(os.path.getmtime(file_path), os.path.getctime(file_path))) > CACHE_DURATION:
+            os.remove(file_path)
+            logger.info(f"Removed partial file: {file_path} (outside cache duration)")
+        DOWNLOAD_TASKS[file_path] = {"status": "failed", "url": link, "error": str(e)}
+        logger.error(f"Background download error for {link}: {e}")
 
 # Streaming endpoint
 @app.get("/stream/{filename}")
@@ -744,95 +843,6 @@ async def check_status(filename: str):
     if task:
         return JSONResponse({"status": task["status"], "error": task.get("error")})
     raise HTTPException(status_code=404, detail="No download task found for this file")
-
-# Terabox streaming
-@app.get("/tb/{link_hash}")
-async def stream_terabox(link_hash: str, request: Request):
-    link_data = TERABOX_LINKS.get(link_hash)
-    if not link_data:
-        logger.error(f"Terabox link not found for hash: {link_hash}")
-        raise HTTPException(status_code=404, detail="Link not found")
-
-    filename = link_data["name"]
-    file_path = os.path.join(DOWNLOAD_DIR, filename)
-
-    if os.path.exists(file_path):
-        now = time.time()
-        mtime = os.path.getmtime(file_path)
-        ctime = os.path.getctime(file_path)
-        file_age = now - min(mtime, ctime)
-        logger.debug(f"Streaming Terabox file {file_path}: now={now}, mtime={mtime}, ctime={ctime}, age={file_age:.2f} seconds")
-        if file_age > CACHE_DURATION or file_age < -3600:
-            logger.warning(f"File {file_path} has invalid age ({file_age:.2f} seconds), checking DOWNLOAD_TASKS")
-            if file_path in DOWNLOAD_TASKS and DOWNLOAD_TASKS[file_path]["status"] == "completed":
-                logger.info(f"File {file_path} is marked as completed in DOWNLOAD_TASKS, serving anyway")
-            else:
-                logger.warning(f"File {file_path} is older than cache duration ({file_age:.2f} seconds), removing")
-                os.remove(file_path)
-                if file_path in DOWNLOAD_TASKS:
-                    del DOWNLOAD_TASKS[file_path]
-                    logger.debug(f"Cleared expired task for {file_path} from DOWNLOAD_TASKS")
-                raise HTTPException(status_code=404, detail="File no longer available (expired)")
-        ext = filename.rsplit(".", 1)[-1].lower()
-        content_type = {
-            "mp4": "video/mp4",
-            "mkv": "video/x-matroska",
-            "avi": "video/x-msvideo",
-            "mp3": "audio/mpeg"
-        }.get(ext, "application/octet-stream")
-        logger.info(f"Serving existing Terabox file: {file_path}")
-        return FileResponse(file_path, media_type=content_type)
-
-    logger.error(f"Terabox file not yet available: {file_path}")
-    raise HTTPException(status_code=404, detail="File not yet available")
-
-# Terabox status check
-@app.get("/tb_status/{link_hash}")
-async def check_download_status(link_hash: str, request: Request):
-    link_data = TERABOX_LINKS.get(link_hash)
-    if not link_data:
-        logger.error(f"No Terabox link found for hash: {link_hash}")
-        raise HTTPException(status_code=404, detail="No download task found")
-    file_path = os.path.join(DOWNLOAD_DIR, link_data["name"])
-    task = DOWNLOAD_TASKS.get(file_path)
-    if not task:
-        logger.error(f"No download task found for file: {file_path}")
-        raise HTTPException(status_code=404, detail="No download task found")
-    base_url = str(request.base_url).rstrip('/')
-    logger.info(f"Terabox status for {link_hash}: {task['status']}")
-    return JSONResponse({
-        "status": task["status"],
-        "stream_link": f"{base_url}/stream/{os.path.basename(task['file_path'])}" if task["status"] == "completed" else None,
-        "error": task.get("error")
-    })
-
-# Background download for Terabox
-async def background_download(link_hash, link, file_path):
-    try:
-        DOWNLOAD_TASKS[file_path] = {"status": "downloading", "url": link}
-        if os.path.exists(file_path):
-            file_age = time.time() - min(os.path.getmtime(file_path), os.path.getctime(file_path))
-            if file_age < CACHE_DURATION:
-                logger.info(f"Skipping download for {file_path}: File exists and is within cache duration ({file_age:.2f} seconds)")
-                DOWNLOAD_TASKS[file_path] = {"status": "completed", "url": link}
-                return
-
-        logger.info(f"Started background download for {link}")
-        if await download_file(link, file_path):
-            logger.info(f"Completed background download for {file_path}")
-            DOWNLOAD_TASKS[file_path] = {"status": "completed", "url": link}
-        else:
-            if os.path.exists(file_path) and (time.time() - min(os.path.getmtime(file_path), os.path.getctime(file_path))) > CACHE_DURATION:
-                os.remove(file_path)
-                logger.info(f"Removed partial file: {file_path} (outside cache duration)")
-            DOWNLOAD_TASKS[file_path] = {"status": "failed", "url": link, "error": "Download failed"}
-            logger.error(f"Background download failed for {link}")
-    except Exception as e:
-        if os.path.exists(file_path) and (time.time() - min(os.path.getmtime(file_path), os.path.getctime(file_path))) > CACHE_DURATION:
-            os.remove(file_path)
-            logger.info(f"Removed partial file: {file_path} (outside cache duration)")
-        DOWNLOAD_TASKS[file_path] = {"status": "failed", "url": link, "error": str(e)}
-        logger.error(f"Background download error for {link}: {e}")
 
 if __name__ == "__main__":
     import uvicorn
