@@ -87,7 +87,7 @@ async def clean_old_files():
         if os.path.isfile(file_path):
             mtime = os.path.getmtime(file_path)
             ctime = os.path.getctime(file_path)
-            file_age = now - min(mtime, ctime)  # Use earliest timestamp
+            file_age = now - min(mtime, ctime)
             logger.debug(f"Checking file {file_path}: mtime={mtime}, ctime={ctime}, now={now}, age={file_age:.2f} seconds")
             if file_age > CACHE_DURATION:
                 try:
@@ -216,21 +216,63 @@ async def download_file(url, path):
             logger.error(f"Error downloading file {url}: {e}")
             return False
 
-# Instagram video URL and title extraction
+# Instagram video URL and title extraction with retries
 async def get_instagram_video_info(post_url):
     def sync_get_instagram_info():
-        try:
-            L = instaloader.Instaloader()
-            shortcode = post_url.split("/")[-2]
-            post = instaloader.Post.from_shortcode(L.context, shortcode)
-            return {
-                "video_url": post.video_url if post.is_video else None,
-                "title": post.caption or f"Instagram_{shortcode}",
-                "thumbnail": post.url
-            }
-        except Exception as e:
-            logger.error(f"Error fetching Instagram info: {e}")
-            return None
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                L = instaloader.Instaloader()
+                # Optional: Add Instagram login for private accounts or to bypass rate limits
+                username = os.getenv("INSTAGRAM_USERNAME")
+                password = os.getenv("INSTAGRAM_PASSWORD")
+                if username and password:
+                    try:
+                        L.login(username, password)
+                        logger.info(f"Logged into Instagram as {username}")
+                    except Exception as e:
+                        logger.warning(f"Instagram login failed: {e}")
+                
+                # Validate URL
+                if not is_instagram_url(post_url) or "/p/" not in post_url:
+                    logger.error(f"Invalid Instagram URL: {post_url}")
+                    return None
+                
+                shortcode = post_url.split("/")[-2]
+                if not shortcode:
+                    logger.error(f"Could not extract shortcode from URL: {post_url}")
+                    return None
+                
+                post = instaloader.Post.from_shortcode(L.context, shortcode)
+                if not post.is_video:
+                    logger.error(f"Instagram post is not a video: {post_url}")
+                    return None
+                
+                return {
+                    "video_url": post.video_url,
+                    "title": post.caption or f"Instagram_{shortcode}",
+                    "thumbnail": post.url
+                }
+            except instaloader.exceptions.BadCredentialsException as e:
+                logger.error(f"Instagram authentication failed: {e}")
+                return None
+            except instaloader.exceptions.InvalidArgumentException as e:
+                logger.error(f"Invalid Instagram shortcode: {e}")
+                return None
+            except instaloader.exceptions.ConnectionException as e:
+                logger.error(f"Instagram connection error (attempt {attempt + 1}/{max_retries}): {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** (attempt + 1))
+                    continue
+                return None
+            except Exception as e:
+                logger.error(f"Error fetching Instagram info (attempt {attempt + 1}/{max_retries}): {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** (attempt + 1))
+                    continue
+                return None
+        logger.error(f"Failed to fetch Instagram info after {max_retries} attempts for URL: {post_url}")
+        return None
     return await asyncio.get_event_loop().run_in_executor(executor, sync_get_instagram_info)
 
 # Instagram video processing using ffmpeg
@@ -311,6 +353,26 @@ async def download_video(request: Request):
     else:
         logger.error(f"Unsupported URL type: {url}")
         raise HTTPException(status_code=400, detail=f"Unsupported URL type: {url}")
+
+# New YouTube ID endpoint
+@app.get("/yt")
+async def download_youtube_by_id(request: Request):
+    video_id = request.query_params.get("id")
+    if not video_id:
+        logger.error("No video ID provided in request")
+        raise HTTPException(status_code=400, detail="Video ID parameter is required")
+
+    # Validate video ID (basic check for YouTube ID format: 11 characters, alphanumeric, and special chars)
+    if not (8 <= len(video_id) <= 12 and all(c.isalnum() or c in "-_" for c in video_id)):
+        logger.error(f"Invalid YouTube video ID: {video_id}")
+        raise HTTPException(status_code=400, detail="Invalid YouTube video ID")
+
+    # Construct YouTube URL
+    url = f"https://youtu.be/{video_id}"
+    logger.info(f"Constructed YouTube URL from ID {video_id}: {url}")
+
+    # Always request both video and audio, default to 1080p for video
+    return await handle_yt_dlp(url, request, sound=False, quality="1080", platform="youtube", is_authenticated=False)
 
 # Generic yt-dlp handler
 async def handle_yt_dlp(url: str, request: Request, sound: bool = False, quality: str = None, platform: str = "generic", is_authenticated: bool = False):
@@ -457,7 +519,7 @@ async def handle_terabox(url: str, request: Request, is_authenticated: bool):
 # Spotify handler
 @cached(ttl=300, cache=Cache.MEMORY)
 async def handle_spotify(url: str, request: Request, is_authenticated: bool):
-    api_url = f"http://sp.hosters.club/?url={url}"
+    api_url = f"https://sp.hosters.club/?url={url}"
     max_retries = 3
     retry_status_codes = [400, 404, 429, 500, 502, 503, 504]
     for attempt in range(max_retries):
@@ -672,7 +734,7 @@ async def stream_file(filename: str):
     logger.error(f"File not found: {file_path}")
     raise HTTPException(status_code=404, detail="File not yet available")
 
-# New status check endpoint
+# Status check endpoint
 @app.get("/status/{filename}")
 async def check_status(filename: str):
     file_path = os.path.join(DOWNLOAD_DIR, filename)
