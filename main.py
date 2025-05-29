@@ -168,6 +168,110 @@ def extract_youtube_id(url):
             return match.group(1)
     return None
 
+# Parse HTML response from Vatis API and extract JSON
+def parse_vatis_html_response(html_content):
+    try:
+        soup = BeautifulSoup(html_content, 'html.parser')
+        
+        # Method 1: Look for JSON in script tags
+        for script in soup.find_all('script'):
+            if script.string:
+                # Look for common JSON patterns
+                json_patterns = [
+                    r'videoUrl\s*:\s*["\']([^"\']+)["\']',
+                    r'audioUrl\s*:\s*["\']([^"\']+)["\']',
+                    r'"videoUrl"\s*:\s*"([^"]+)"',
+                    r'"audioUrl"\s*:\s*"([^"]+)"',
+                    r'video_url\s*:\s*["\']([^"\']+)["\']',
+                    r'audio_url\s*:\s*["\']([^"\']+)["\']'
+                ]
+                
+                video_url = None
+                audio_url = None
+                title = "Unknown Title"
+                
+                for pattern in json_patterns:
+                    matches = re.findall(pattern, script.string, re.IGNORECASE)
+                    for match in matches:
+                        if 'video' in pattern.lower() and not video_url:
+                            video_url = match
+                        elif 'audio' in pattern.lower() and not audio_url:
+                            audio_url = match
+                
+                # Look for title
+                title_patterns = [
+                    r'title\s*:\s*["\']([^"\']+)["\']',
+                    r'"title"\s*:\s*"([^"]+)"',
+                    r'video_title\s*:\s*["\']([^"\']+)["\']'
+                ]
+                
+                for pattern in title_patterns:
+                    match = re.search(pattern, script.string, re.IGNORECASE)
+                    if match:
+                        title = match.group(1)
+                        break
+                
+                if video_url or audio_url:
+                    return {
+                        "videoUrl": video_url,
+                        "audioUrl": audio_url,
+                        "title": title
+                    }
+        
+        # Method 2: Look for JSON in data attributes
+        for element in soup.find_all(attrs={"data-video": True}):
+            try:
+                data = json.loads(element.get("data-video"))
+                if data.get("videoUrl") or data.get("audioUrl"):
+                    return data
+            except json.JSONDecodeError:
+                continue
+        
+        # Method 3: Look for download links directly in HTML
+        video_links = soup.find_all('a', href=re.compile(r'\.(mp4|webm|mkv)'))
+        audio_links = soup.find_all('a', href=re.compile(r'\.(mp3|m4a|wav)'))
+        
+        if video_links or audio_links:
+            return {
+                "videoUrl": video_links[0].get('href') if video_links else None,
+                "audioUrl": audio_links[0].get('href') if audio_links else None,
+                "title": soup.title.string if soup.title else "Unknown Title"
+            }
+        
+        # Method 4: Look for any URLs that look like media files
+        all_text = soup.get_text()
+        url_patterns = [
+            r'https?://[^\s<>"]+\.mp4[^\s<>"]*',
+            r'https?://[^\s<>"]+\.mp3[^\s<>"]*',
+            r'https?://[^\s<>"]+\.webm[^\s<>"]*',
+            r'https?://[^\s<>"]+\.m4a[^\s<>"]*'
+        ]
+        
+        for pattern in url_patterns:
+            matches = re.findall(pattern, all_text)
+            if matches:
+                video_url = None
+                audio_url = None
+                for match in matches:
+                    if any(ext in match.lower() for ext in ['.mp4', '.webm', '.mkv']):
+                        video_url = match
+                    elif any(ext in match.lower() for ext in ['.mp3', '.m4a', '.wav']):
+                        audio_url = match
+                
+                if video_url or audio_url:
+                    return {
+                        "videoUrl": video_url,
+                        "audioUrl": audio_url,
+                        "title": "Unknown Title"
+                    }
+        
+        logger.warning("No video/audio URLs found in HTML response")
+        return None
+        
+    except Exception as e:
+        logger.error(f"Error parsing HTML response: {e}")
+        return None
+
 # File download utility
 async def download_file(url, path):
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=300)) as session:
@@ -390,51 +494,25 @@ async def handle_youtube_vatis(url: str, request: Request, sound: bool = False, 
                     logger.error(f"Vatis API returned status {response.status}")
                     raise HTTPException(status_code=response.status, detail="Failed to fetch YouTube URLs")
 
-                # Try to extract JSON from HTML
-                try:
-                    if 'text/html' in content_type:
-                        logger.debug("Attempting to extract JSON from HTML response")
-                        soup = BeautifulSoup(response_text, 'html.parser')
-                        # Look for JSON in script tags or hidden fields
-                        json_data = None
-                        for script in soup.find_all('script'):
-                            if script.string:
-                                # Common patterns for JSON data
-                                json_match = re.search(r'(\{.*\})', script.string, re.DOTALL)
-                                if json_match:
-                                    try:
-                                        json_data = json.loads(json_match.group(1))
-                                        break
-                                    except json.JSONDecodeError:
-                                        continue
-                        if json_data and json_data.get("videoUrl") or json_data.get("audioUrl"):
-                            response_data = {
-                                "videoUrl": json_data.get("videoUrl") if not sound else None,
-                                "audioUrl": json_data.get("audioUrl") if sound or not quality else None,
-                                "title": json_data.get("title", "Unknown Title"),
-                                "videoId": video_id
-                            }
-                            logger.info(f"Extracted JSON from HTML: {response_data}")
-                            return JSONResponse(response_data)
-                        logger.warning("No valid JSON found in HTML response")
-                    else:
-                        # Assume JSON response
-                        json_data = json.loads(response_text)
-                        response_data = {
-                            "videoUrl": json_data.get("videoUrl") if not sound else None,
-                            "audioUrl": json_data.get("audioUrl") if sound or not quality else None,
-                            "title": json_data.get("title", "Unknown Title"),
-                            "videoId": video_id
-                        }
-                        logger.info(f"Vatis API JSON response: {response_data}")
-                        return JSONResponse(response_data)
-                except json.JSONDecodeError as e:
-                    logger.error(f"Failed to parse JSON from Vatis API response: {e}")
-                    logger.debug(f"Raw response: {response_text[:1000]}...")  # Log first 1000 chars
-                except Exception as e:
-                    logger.error(f"Error processing Vatis API response: {e}")
+                # Parse HTML response to extract JSON data
+                parsed_data = parse_vatis_html_response(response_text)
+                
+                if parsed_data and (parsed_data.get("videoUrl") or parsed_data.get("audioUrl")):
+                    response_data = {
+                        "videoUrl": parsed_data.get("videoUrl") if not sound else None,
+                        "audioUrl": parsed_data.get("audioUrl") if sound else None,
+                        "title": parsed_data.get("title", "Unknown Title"),
+                        "videoId": video_id
+                    }
+                    logger.info(f"Successfully parsed Vatis API response: {response_data}")
+                    return JSONResponse(response_data)
+                else:
+                    logger.warning("Could not extract video/audio URLs from Vatis API response")
+
         except aiohttp.ClientError as e:
             logger.error(f"Vatis API request failed: {e}")
+        except Exception as e:
+            logger.error(f"Error processing Vatis API response: {e}")
 
     # Fallback to yt-dlp
     logger.info(f"Falling back to yt-dlp for YouTube URL: {url}")
@@ -480,7 +558,7 @@ async def handle_youtube_vatis(url: str, request: Request, sound: bool = False, 
 
         response_data = {
             "videoUrl": video_url if not sound else None,
-            "audioUrl": audio_url if sound or not quality else None,
+            "audioUrl": audio_url if sound else None,
             "title": metadata.get("title", "Unknown Title"),
             "videoId": video_id
         }
@@ -739,9 +817,9 @@ async def stream_spotify(track_hash: str, request: Request):
     raise HTTPException(status_code=404, detail="File not yet available")
 
 # Background download for Spotify
-async def background_download_spotify(download_id, track_url, file_path):
+async def background_spotify_download(download_id, track_url, file_path):
     try:
-        DOWNLOAD_TASKS[file_path] = {"status": "downloading", "download_url": track_url}
+        DOWNLOAD_TASKS[file_path] = {"status": "downloading", "url": track_url}
         if os.path.exists(file_path):
             file_age = time.time() - min(os.path.getmtime(file_path), os.path.getctime(file_path))
             if file_age < CACHE_DURATION:
@@ -752,23 +830,23 @@ async def background_download_spotify(download_id, track_url, file_path):
         logger.info(f"Started background download for Spotify: {track_url}")
         if await download_file(track_url, file_path):
             logger.info(f"Completed background download for {file_path}")
-            DOWNLOAD_TASKS[file_path] = {"status": "completed", "file_url": track_url}
+            DOWNLOAD_TASKS[file_path] = {"status": "completed", "url": track_url}
         else:
-            if os.path.exists(file_path) and (time.time() - min(os.path.getmtime(file_path), os.path.getmtime(file_path))) > CACHE_DURATION:
+            if os.path.exists(file_path) and (time.time() - min(os.path.getmtime(file_path), os.path.getctime(file_path))) > CACHE_DURATION:
                 os.remove(file_path)
                 logger.info(f"Removed partial file: {file_path} (outside cache duration)")
             DOWNLOAD_TASKS[file_path] = {"status": "failed", "url": track_url, "error": "Download failed"}
             logger.error(f"Background download failed for {track_url}")
     except Exception as e:
-        if os.path.exists(file_path) and (time.time() - min(os.path.getmtime(file_path), os.path.getmtime(file_path))) > CACHE_DURATION:
+        if os.path.exists(file_path) and (time.time() - min(os.path.getmtime(file_path), os.path.getctime(file_path))) > CACHE_DURATION:
             os.remove(file_path)
             logger.info(f"Removed partial file {file_path} (outside cache duration)")
-        DOWNLOAD_TASKS[file_path] = {"status": "failed", "url": "", "error": str(e)}
+        DOWNLOAD_TASKS[file_path] = {"status": "failed", "url": track_url, "error": str(e)}
         logger.error(f"Background download error for {track_url}: {e}")
 
 # Terabox handler
-@cached(ttl=300, cache=Cache().MEMORY)
-async def handle_tdownload(url: str, request: Request, is_authenticated: bool):
+@cached(ttl=300, cache=Cache.MEMORY)
+async def handle_terabox(url: str, request: Request, is_authenticated: bool):
     api_url = f"https://tb.hosters.club/?url={url}"
     max_retries = 3
     retry_status_codes = [400, 404, 405, 504]
@@ -816,17 +894,17 @@ async def handle_tdownload(url: str, request: Request, is_authenticated: bool):
         except aiohttp.ClientError as e:
             logger.error(f"Terabox API request failed on attempt {attempt + 1}: {e}")
             if attempt == max_retries - 1:
-                raise HTTPException(status_code=500, detail=f"Failed to fetch Terabox API failed after {max_retries} attempts: {str(e)}")
+                raise HTTPException(status_code=500, detail=f"Failed to fetch Terabox API after {max_retries} attempts: {str(e)}")
             await asyncio.sleep(2 ** (attempt + 1))
-    logger.error(f"Failed to fetch Teradata after {max_retries} attempts for URL: {url}")
-    raise HTTPException(status_code=500, detail=f"Failed to fetch Teradata after {max_retries} attempts")
+    logger.error(f"Failed to fetch Terabox data after {max_retries} attempts for URL: {url}")
+    raise HTTPException(status_code=500, detail=f"Failed to fetch Terabox data after {max_retries} attempts")
 
-# Teradata streaming
+# Terabox streaming
 @app.get("/tb/{link_hash}")
-async def stream_tdata(link_hash: str, request: Request):
+async def stream_terabox(link_hash: str, request: Request):
     link_data = TERABOX_LINKS.get(link_hash)
     if not link_data:
-        logger.error(f"Teradata link not found for hash: {link_hash}")
+        logger.error(f"Terabox link not found for hash: {link_hash}")
         raise HTTPException(status_code=404, detail="Link not found")
 
     filename = link_data["name"]
@@ -837,12 +915,12 @@ async def stream_tdata(link_hash: str, request: Request):
         mtime = os.path.getmtime(file_path)
         ctime = os.path.getctime(file_path)
         file_age = now - min(mtime, ctime)
-        logger.debug(f"Streaming Teradata file {file_path}: now={now}, mtime={mtime}, ctime={ctime}, age={file_age:.2f} seconds")
+        logger.debug(f"Streaming Terabox file {file_path}: now={now}, mtime={mtime}, ctime={ctime}, age={file_age:.2f} seconds")
         if file_age > CACHE_DURATION or file_age < -3600:
-            logger.warning(f"File {file_path} has invalid age ({file_age:.2f} seconds), checking DOWNLOAD_LINKS")
+            logger.warning(f"File {file_path} has invalid age ({file_age:.2f} seconds), checking DOWNLOAD_TASKS")
             if file_path in DOWNLOAD_TASKS and DOWNLOAD_TASKS[file_path]["status"] == "completed":
                 logger.info(f"File {file_path} is marked as completed in DOWNLOAD_TASKS, serving anyway")
-                else:
+            else:
                 logger.error(f"File {file_path} is older than cache duration ({file_age:.2f} seconds), removing")
                 os.remove(file_path)
                 if file_path in DOWNLOAD_TASKS:
@@ -856,13 +934,13 @@ async def stream_tdata(link_hash: str, request: Request):
             "avi": "video/x-msvideo",
             "mp3": "audio/mpeg"
         }.get(ext, "application/octet-stream")
-        logger.info(f"Successfully serving Teradata file: {file_path}")
+        logger.info(f"Successfully serving Terabox file: {file_path}")
         return FileResponse(file_path, media_type=content_type)
 
-    logger.error(f"Teradata file not yet available: {file_path}")
+    logger.error(f"Terabox file not yet available: {file_path}")
     raise HTTPException(status_code=404, detail="File not yet available")
 
-# Background download for Teradata
+# Background download for Terabox
 async def background_download(link_hash, link, file_path):
     try:
         DOWNLOAD_TASKS[file_path] = {"status": "downloading", "url": link}
