@@ -102,6 +102,17 @@ def clean_youtube_url(url):
         logger.error(f"Failed to clean YouTube URL {url}: {e}")
         return url
 
+# Clean Instagram URL
+def clean_instagram_url(url):
+    try:
+        parsed = urlparse(url)
+        # Keep only scheme, netloc, and path (remove query parameters)
+        cleaned = urlunparse((parsed.scheme, parsed.netloc, parsed.path, '', '', ''))
+        return cleaned.rstrip('/')
+    except Exception as e:
+        logger.error(f"Failed to clean Instagram URL {url}: {e}")
+        return url
+
 # Optimized file cleanup for high volume
 async def clean_old_files():
     """Non-blocking file cleanup"""
@@ -133,7 +144,7 @@ def is_terabox_url(url):
 def is_spotify_url(url): 
     return "spotify.com" in url.lower()
 def is_instagram_url(url): 
-    return "instagram.com" in url.lower()
+    return "instagram.com" in url.lower() and any(x in url.lower() for x in ["reel", "p", "tv"])
 def is_youtube_url(url): 
     return url and ("youtube.com" in url.lower() or "youtu.be" in url.lower() or "googlevideo.com" in url.lower())
 def is_yt_dlp_supported(url): 
@@ -177,7 +188,7 @@ def get_yt_dlp_metadata(url):
     return {"title": "Unknown Title", "thumbnail": None}
 
 # High-performance file download with retries
-async def download_file(url, path, retries=3, delay=1):
+async def download_file(url, path, retries=1):
     async with DOWNLOAD_SEMAPHORE:  # Limit concurrent downloads
         async with aiohttp.ClientSession(
             connector=connector,
@@ -201,11 +212,11 @@ async def download_file(url, path, retries=3, delay=1):
                     logger.error(f"Download error {url}: {e} (Attempt {attempt}/{retries})")
                     if attempt == retries:
                         return False
-                await asyncio.sleep(delay)
+                await asyncio.sleep(1)
             return False
 
-# Instagram info extraction (optimized)
-async def get_instagram_video_info(post_url):
+# Instagram info extraction with retries
+async def get_instagram_video_info(post_url, retries=3, delay=1):
     def sync_get_info():
         try:
             L = instaloader.Instaloader()
@@ -221,7 +232,21 @@ async def get_instagram_video_info(post_url):
             logger.error(f"Instagram info error: {e}")
             return None
     
-    return await asyncio.get_event_loop().run_in_executor(executor, sync_get_info)
+    for attempt in range(1, retries + 1):
+        try:
+            result = await asyncio.get_event_loop().run_in_executor(executor, sync_get_info)
+            if result:
+                return result
+            logger.warning(f"Failed to get Instagram info for {post_url} (Attempt {attempt}/{retries})")
+            if attempt == retries:
+                return None
+            await asyncio.sleep(delay)
+        except Exception as e:
+            logger.error(f"Instagram info error for {post_url}: {e} (Attempt {attempt}/{retries})")
+            if attempt == retries:
+                return None
+            await asyncio.sleep(delay)
+    return None
 
 # Enhanced Instagram processing
 async def process_instagram_video(temp_path, output_path, sound=False, quality=None):
@@ -313,7 +338,7 @@ def create_inline_keyboard(mp4_url=None, mp3_url=None, direct_link=None):
         keyboard.append([{"text": "📥 Direct Download", "url": direct_link}])
     return {"inline_keyboard": keyboard}
 
-# Telegram Webhook Handler
+# Telegram Webhook Handler with improved error feedback
 @app.post("/telegram_webhook")
 async def telegram_webhook(request: Request):
     try:
@@ -393,20 +418,23 @@ async def telegram_webhook(request: Request):
                                 else:
                                     await send_telegram_message(chat_id, response_text, keyboard)
                             else:
+                                error_msg = f"Failed to process URL: {url}\nReason: API returned status {response.status}"
+                                logger.error(error_msg)
                                 await send_telegram_message(
                                     chat_id,
-                                    f"❌ Failed to process URL: {url}\n\nPlease try again or contact @SUN_GOD_LUFFYY"
+                                    f"❌ {error_msg}\n\nPlease try again or contact @SUN_GOD_LUFFYY"
                                 )
                 except Exception as e:
-                    logger.error(f"Error processing URL {url}: {e}")
+                    error_msg = f"Error processing URL: {url}\nReason: {str(e)}"
+                    logger.error(error_msg)
                     await send_telegram_message(
                         chat_id,
-                        f"❌ Error processing URL: {url}\n\n👨‍💻 Contact: @SUN_GOD_LUFFYY"
+                        f"❌ {error_msg}\n\n👨‍💻 Contact: @SUN_GOD_LUFFYY"
                     )
         else:
             await send_telegram_message(
                 chat_id,
-                "📎 Please send a valid URL!\n\n✅ Supported: YouTube, Instagram, Spotify, Terabox and more!\n\n👨‍💻 Dev: @SUN_GOD_LUFFYY"
+                "📎 Please send a valid URL!\n\n✅ Supported: YouTube, Instagram (reels, posts, IGTV), Spotify, Terabox, and more!\n\n👨‍💻 Dev: @SUN_GOD_LUFFYY"
             )
         
         return JSONResponse({"ok": True})
@@ -429,10 +457,15 @@ async def download_video(request: Request):
         raise HTTPException(status_code=400, detail="URL parameter is required")
 
     if not (url.startswith("http://") or url.startswith("https://")):
-        if url.startswith("www.") or any(domain in url for domain in ["youtube.com", "instagram.com", "spotify.com"]):
+        if url.startswith("www.") or any(domain in url for domain in ["youtube.com", "youtu.be", "instagram.com", "spotify.com", "terabox.com"]):
             url = "https://" + url
         else:
-            raise HTTPException(status_code=400, detail="Invalid URL")
+            raise HTTPException(status_code=400, detail="Invalid URL format")
+
+    if is_instagram_url(url):
+        url = clean_instagram_url(url)  # Clean Instagram URL
+    elif is_youtube_url(url):
+        url = clean_youtube_url(url)
 
     logger.info(f"Processing URL: {url}")
 
@@ -501,7 +534,7 @@ async def handle_yt_dlp(url: str, request: Request, sound: bool = False, quality
 
     return JSONResponse(response)
 
-# FIXED background yt-dlp download with retries and proper MP3 handling
+# FIXED background yt-dlp download with retries
 async def background_yt_dlp_download(url, path, download_type, quality=None, retries=3, delay=1):
     async with DOWNLOAD_SEMAPHORE:
         try:
@@ -525,7 +558,6 @@ async def background_yt_dlp_download(url, path, download_type, quality=None, ret
                 format_selector = quality_map.get(quality, "best")
                 cmd = f'yt-dlp -f "{format_selector}" {cookie_option} --no-check-certificate -o "{path}" "{url}"'
             else:
-                # FIXED MP3 extraction command
                 cmd = f'yt-dlp --extract-audio --audio-format mp3 --audio-quality 320K {cookie_option} --no-check-certificate -o "{path.replace(".mp3", ".%(ext)s")}" "{url}"'
             
             logger.info(f"Starting {download_type} download: {os.path.basename(path)}")
@@ -535,7 +567,6 @@ async def background_yt_dlp_download(url, path, download_type, quality=None, ret
             
             for attempt in range(1, retries + 1):
                 try:
-                    # Run in thread pool to avoid blocking
                     process = await asyncio.get_event_loop().run_in_executor(executor, run_download)
                     
                     if process.returncode == 0:
@@ -642,7 +673,9 @@ async def handle_spotify(url: str, request: Request):
 async def handle_instagram(url: str, request: Request, sound: bool = False, quality: str = None):
     info = await get_instagram_video_info(url)
     if not info or not info["video_url"]:
-        raise HTTPException(status_code=400, detail="Invalid Instagram URL")
+        error_msg = f"Invalid Instagram URL or no video found: {url}"
+        logger.error(error_msg)
+        raise HTTPException(status_code=400, detail=error_msg)
 
     output_filename = get_unique_filename(url, quality or "original", sound)
     output_path = os.path.join(DOWNLOAD_DIR, output_filename)
@@ -667,7 +700,7 @@ async def background_download(url, file_path, retries=3, delay=1):
     try:
         DOWNLOAD_TASKS[file_path] = {"status": "downloading", "url": url, "retries": 0, "last_error": None}
         for attempt in range(1, retries + 1):
-            if await download_file(url, file_path, retries=1):  # Single attempt per call, retries handled here
+            if await download_file(url, file_path, retries=1):
                 DOWNLOAD_TASKS[file_path] = {"status": "completed", "url": url, "retries": attempt - 1}
                 logger.info(f"Completed download: {os.path.basename(file_path)}")
                 return
@@ -695,7 +728,7 @@ async def background_instagram_download(video_url, output_path, sound, quality, 
         
         for attempt in range(1, retries + 1):
             try:
-                if await download_file(video_url, temp_path, retries=1):  # Single attempt per call
+                if await download_file(video_url, temp_path, retries=1):
                     if await process_instagram_video(temp_path, output_path, sound, quality):
                         DOWNLOAD_TASKS[output_path] = {"status": "completed", "url": video_url, "retries": attempt - 1}
                         logger.info(f"Completed Instagram download: {os.path.basename(output_path)}")
