@@ -176,28 +176,33 @@ def get_yt_dlp_metadata(url):
     
     return {"title": "Unknown Title", "thumbnail": None}
 
-# High-performance file download
-async def download_file(url, path):
+# High-performance file download with retries
+async def download_file(url, path, retries=3, delay=1):
     async with DOWNLOAD_SEMAPHORE:  # Limit concurrent downloads
         async with aiohttp.ClientSession(
             connector=connector,
             timeout=aiohttp.ClientTimeout(total=600),
             headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
         ) as session:
-            try:
-                async with session.get(url) as response:
-                    if response.status == 200:
-                        async with aiofiles.open(path, "wb") as f:
-                            async for chunk in response.content.iter_chunked(16384):  # Larger chunks
-                                await f.write(chunk)
-                        logger.info(f"Downloaded: {os.path.basename(path)}")
-                        return True
-                    else:
-                        logger.error(f"Download failed {url}: Status {response.status}")
+            for attempt in range(1, retries + 1):
+                try:
+                    async with session.get(url) as response:
+                        if response.status == 200:
+                            async with aiofiles.open(path, "wb") as f:
+                                async for chunk in response.content.iter_chunked(16384):  # Larger chunks
+                                    await f.write(chunk)
+                            logger.info(f"Downloaded: {os.path.basename(path)}")
+                            return True
+                        else:
+                            logger.error(f"Download failed {url}: Status {response.status} (Attempt {attempt}/{retries})")
+                            if attempt == retries:
+                                return False
+                except Exception as e:
+                    logger.error(f"Download error {url}: {e} (Attempt {attempt}/{retries})")
+                    if attempt == retries:
                         return False
-            except Exception as e:
-                logger.error(f"Download error {url}: {e}")
-                return False
+                await asyncio.sleep(delay)
+            return False
 
 # Instagram info extraction (optimized)
 async def get_instagram_video_info(post_url):
@@ -496,14 +501,15 @@ async def handle_yt_dlp(url: str, request: Request, sound: bool = False, quality
 
     return JSONResponse(response)
 
-# FIXED background yt-dlp download with proper MP3 handling
-async def background_yt_dlp_download(url, path, download_type, quality=None):
+# FIXED background yt-dlp download with retries and proper MP3 handling
+async def background_yt_dlp_download(url, path, download_type, quality=None, retries=3, delay=1):
     async with DOWNLOAD_SEMAPHORE:
         try:
-            DOWNLOAD_TASKS[path] = {"status": "downloading", "url": url}
+            DOWNLOAD_TASKS[path] = {"status": "downloading", "url": url, "retries": 0, "last_error": None}
             
             if os.path.exists(path):
-                DOWNLOAD_TASKS[path] = {"status": "completed", "url": url}
+                DOWNLOAD_TASKS[path] = {"status": "completed", "url": url, "retries": 0}
+                logger.info(f"File already exists: {os.path.basename(path)}")
                 return
 
             cookie_option = f"--cookies {COOKIES_FILE}" if validate_cookies_file() else ""
@@ -527,19 +533,34 @@ async def background_yt_dlp_download(url, path, download_type, quality=None):
             def run_download():
                 return subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=1800)
             
-            # Run in thread pool to avoid blocking
-            process = await asyncio.get_event_loop().run_in_executor(executor, run_download)
-            
-            if process.returncode == 0:
-                DOWNLOAD_TASKS[path] = {"status": "completed", "url": url}
-                logger.info(f"Completed {download_type} download: {os.path.basename(path)}")
-            else:
-                DOWNLOAD_TASKS[path] = {"status": "failed", "url": url, "error": process.stderr}
-                logger.error(f"Download failed: {process.stderr}")
+            for attempt in range(1, retries + 1):
+                try:
+                    # Run in thread pool to avoid blocking
+                    process = await asyncio.get_event_loop().run_in_executor(executor, run_download)
+                    
+                    if process.returncode == 0:
+                        DOWNLOAD_TASKS[path] = {"status": "completed", "url": url, "retries": attempt - 1}
+                        logger.info(f"Completed {download_type} download: {os.path.basename(path)}")
+                        return
+                    else:
+                        error_msg = process.stderr[:500]  # Limit error message length
+                        DOWNLOAD_TASKS[path] = {"status": "downloading", "url": url, "retries": attempt, "last_error": error_msg}
+                        logger.error(f"Download failed for {url}: {error_msg} (Attempt {attempt}/{retries})")
+                        if attempt == retries:
+                            DOWNLOAD_TASKS[path] = {"status": "failed", "url": url, "retries": attempt, "last_error": error_msg}
+                            return
+                except Exception as e:
+                    error_msg = str(e)
+                    DOWNLOAD_TASKS[path] = {"status": "downloading", "url": url, "retries": attempt, "last_error": error_msg}
+                    logger.error(f"Download error for {url}: {e} (Attempt {attempt}/{retries})")
+                    if attempt == retries:
+                        DOWNLOAD_TASKS[path] = {"status": "failed", "url": url, "retries": attempt, "last_error": error_msg}
+                        return
+                await asyncio.sleep(delay)
             
         except Exception as e:
-            DOWNLOAD_TASKS[path] = {"status": "failed", "url": url, "error": str(e)}
-            logger.error(f"Download error: {e}")
+            DOWNLOAD_TASKS[path] = {"status": "failed", "url": url, "retries": retries, "last_error": str(e)}
+            logger.error(f"Critical download error for {url}: {e}")
         finally:
             ACTIVE_DOWNLOADS.discard(path)
 
@@ -600,7 +621,7 @@ async def handle_spotify(url: str, request: Request):
                         if file_path not in ACTIVE_DOWNLOADS:
                             ACTIVE_DOWNLOADS.add(file_path)
                             asyncio.create_task(background_download(track_url, file_path))
-
+                        
                         base_url = str(request.base_url).rstrip('/')
                         return JSONResponse({
                             "title": data.get("name", "Spotify Track"),
@@ -641,36 +662,70 @@ async def handle_instagram(url: str, request: Request, sound: bool = False, qual
         "file_name": output_filename
     })
 
-# BACKGROUND download functions
-async def background_download(url, file_path):
+# BACKGROUND download functions with retries
+async def background_download(url, file_path, retries=3, delay=1):
     try:
-        DOWNLOAD_TASKS[file_path] = {"status": "downloading", "url": url}
-        if await download_file(url, file_path):
-            DOWNLOAD_TASKS[file_path] = {"status": "completed", "url": url}
-        else:
-            DOWNLOAD_TASKS[file_path] = {"status": "failed", "url": url}
+        DOWNLOAD_TASKS[file_path] = {"status": "downloading", "url": url, "retries": 0, "last_error": None}
+        for attempt in range(1, retries + 1):
+            if await download_file(url, file_path, retries=1):  # Single attempt per call, retries handled here
+                DOWNLOAD_TASKS[file_path] = {"status": "completed", "url": url, "retries": attempt - 1}
+                logger.info(f"Completed download: {os.path.basename(file_path)}")
+                return
+            else:
+                error_msg = f"Failed to download {url} (Attempt {attempt}/{retries})"
+                DOWNLOAD_TASKS[file_path] = {"status": "downloading", "url": url, "retries": attempt, "last_error": error_msg}
+                logger.error(error_msg)
+                if attempt == retries:
+                    DOWNLOAD_TASKS[file_path] = {"status": "failed", "url": url, "retries": attempt, "last_error": error_msg}
+                    return
+            await asyncio.sleep(delay)
     except Exception as e:
-        DOWNLOAD_TASKS[file_path] = {"status": "failed", "url": url, "error": str(e)}
+        error_msg = f"Critical download error: {str(e)}"
+        DOWNLOAD_TASKS[file_path] = {"status": "failed", "url": url, "retries": retries, "last_error": error_msg}
+        logger.error(f"Download error for {url}: {e}")
     finally:
         ACTIVE_DOWNLOADS.discard(file_path)
 
-async def background_instagram_download(video_url, output_path, sound, quality):
+async def background_instagram_download(video_url, output_path, sound, quality, retries=3, delay=1):
     temp_filename = f"temp_{int(time.time())}_{os.getpid()}.mp4"
     temp_path = os.path.join(DOWNLOAD_DIR, temp_filename)
     
     try:
-        DOWNLOAD_TASKS[output_path] = {"status": "downloading", "url": video_url}
+        DOWNLOAD_TASKS[output_path] = {"status": "downloading", "url": video_url, "retries": 0, "last_error": None}
         
-        if await download_file(video_url, temp_path):
-            if await process_instagram_video(temp_path, output_path, sound, quality):
-                DOWNLOAD_TASKS[output_path] = {"status": "completed", "url": video_url}
-            else:
-                DOWNLOAD_TASKS[output_path] = {"status": "failed", "url": video_url}
-        else:
-            DOWNLOAD_TASKS[output_path] = {"status": "failed", "url": video_url}
-            
+        for attempt in range(1, retries + 1):
+            try:
+                if await download_file(video_url, temp_path, retries=1):  # Single attempt per call
+                    if await process_instagram_video(temp_path, output_path, sound, quality):
+                        DOWNLOAD_TASKS[output_path] = {"status": "completed", "url": video_url, "retries": attempt - 1}
+                        logger.info(f"Completed Instagram download: {os.path.basename(output_path)}")
+                        return
+                    else:
+                        error_msg = f"Instagram processing failed for {video_url} (Attempt {attempt}/{retries})"
+                        DOWNLOAD_TASKS[output_path] = {"status": "downloading", "url": video_url, "retries": attempt, "last_error": error_msg}
+                        logger.error(error_msg)
+                        if attempt == retries:
+                            DOWNLOAD_TASKS[output_path] = {"status": "failed", "url": video_url, "retries": attempt, "last_error": error_msg}
+                            return
+                else:
+                    error_msg = f"Instagram download failed for {video_url} (Attempt {attempt}/{retries})"
+                    DOWNLOAD_TASKS[output_path] = {"status": "downloading", "url": video_url, "retries": attempt, "last_error": error_msg}
+                    logger.error(error_msg)
+                    if attempt == retries:
+                        DOWNLOAD_TASKS[output_path] = {"status": "failed", "url": video_url, "retries": attempt, "last_error": error_msg}
+                        return
+                await asyncio.sleep(delay)
+            except Exception as e:
+                error_msg = f"Instagram download error: {str(e)} (Attempt {attempt}/{retries})"
+                DOWNLOAD_TASKS[output_path] = {"status": "downloading", "url": video_url, "retries": attempt, "last_error": error_msg}
+                logger.error(error_msg)
+                if attempt == retries:
+                    DOWNLOAD_TASKS[output_path] = {"status": "failed", "url": video_url, "retries": attempt, "last_error": error_msg}
+                    return
     except Exception as e:
-        DOWNLOAD_TASKS[output_path] = {"status": "failed", "url": video_url, "error": str(e)}
+        error_msg = f"Critical Instagram download error: {str(e)}"
+        DOWNLOAD_TASKS[output_path] = {"status": "failed", "url": video_url, "retries": retries, "last_error": error_msg}
+        logger.error(error_msg)
     finally:
         ACTIVE_DOWNLOADS.discard(output_path)
         if os.path.exists(temp_path):
@@ -679,54 +734,88 @@ async def background_instagram_download(video_url, output_path, sound, quality):
             except:
                 pass
 
-# Streaming endpoints
+# Streaming endpoints with enhanced stability
 @app.get("/stream/{filename}")
 async def stream_file(filename: str):
     file_path = os.path.join(DOWNLOAD_DIR, filename)
-    if os.path.exists(file_path):
-        ext = filename.rsplit(".", 1)[-1].lower()
-        content_type = {
-            "mp4": "video/mp4", "mkv": "video/x-matroska", 
-            "avi": "video/x-msvideo", "mp3": "audio/mpeg"
-        }.get(ext, "application/octet-stream")
-        return FileResponse(file_path, media_type=content_type)
-    raise HTTPException(status_code=404, detail="File not yet available")
+    try:
+        if os.path.exists(file_path):
+            ext = filename.rsplit(".", 1)[-1].lower()
+            content_type = {
+                "mp4": "video/mp4", "mkv": "video/x-matroska", 
+                "avi": "video/x-msvideo", "mp3": "audio/mpeg"
+            }.get(ext, "application/octet-stream")
+            return FileResponse(file_path, media_type=content_type)
+        else:
+            task = DOWNLOAD_TASKS.get(file_path, {})
+            logger.warning(f"File not found: {filename}, Task status: {task.get('status', 'unknown')}, Error: {task.get('last_error', 'None')}")
+            raise HTTPException(status_code=404, detail=f"File not yet available. Status: {task.get('status', 'unknown')}, Last error: {task.get('last_error', 'None')}")
+    except Exception as e:
+        logger.error(f"Stream error for {filename}: {e}")
+        raise HTTPException(status_code=500, detail=f"Stream error: {str(e)}")
 
 @app.get("/spotify/{track_hash}")
 async def stream_spotify(track_hash: str):
-    track_data = SPOTIFY_DOWNLOAD_TASKS.get(track_hash)
-    if not track_data:
-        raise HTTPException(status_code=404, detail="Track not found")
-    
-    file_path = track_data["file_path"]
-    if os.path.exists(file_path):
-        return FileResponse(file_path, media_type="audio/mpeg")
-    raise HTTPException(status_code=404, detail="File not yet available")
+    try:
+        track_data = SPOTIFY_DOWNLOAD_TASKS.get(track_hash)
+        if not track_data:
+            logger.warning(f"Spotify track not found: {track_hash}")
+            raise HTTPException(status_code=404, detail="Track not found")
+        
+        file_path = track_data["file_path"]
+        if os.path.exists(file_path):
+            return FileResponse(file_path, media_type="audio/mpeg")
+        else:
+            task = DOWNLOAD_TASKS.get(file_path, {})
+            logger.warning(f"Spotify file not found: {file_path}, Task status: {task.get('status', 'unknown')}, Error: {task.get('last_error', 'None')}")
+            raise HTTPException(status_code=404, detail=f"File not yet available. Status: {task.get('status', 'unknown')}, Last error: {task.get('last_error', 'None')}")
+    except Exception as e:
+        logger.error(f"Spotify stream error for {track_hash}: {e}")
+        raise HTTPException(status_code=500, detail=f"Stream error: {str(e)}")
 
 @app.get("/tb/{link_hash}")
 async def stream_terabox(link_hash: str):
-    link_data = TERABOX_LINKS.get(link_hash)
-    if not link_data:
-        raise HTTPException(status_code=404, detail="Link not found")
-    
-    filename = link_data["name"]
-    file_path = os.path.join(DOWNLOAD_DIR, filename)
-    
-    if os.path.exists(file_path):
-        ext = filename.rsplit(".", 1)[-1].lower()
-        content_type = {"mp4": "video/mp4", "mkv": "video/x-matroska", "avi": "video/x-msvideo"}.get(ext, "application/octet-stream")
-        return FileResponse(file_path, media_type=content_type)
-    raise HTTPException(status_code=404, detail="File not yet available")
+    try:
+        link_data = TERABOX_LINKS.get(link_hash)
+        if not link_data:
+            logger.warning(f"Terabox link not found: {link_hash}")
+            raise HTTPException(status_code=404, detail="Link not found")
+        
+        filename = link_data["name"]
+        file_path = os.path.join(DOWNLOAD_DIR, filename)
+        
+        if os.path.exists(file_path):
+            ext = filename.rsplit(".", 1)[-1].lower()
+            content_type = {"mp4": "video/mp4", "mkv": "video/x-matroska", "avi": "video/x-msvideo"}.get(ext, "application/octet-stream")
+            return FileResponse(file_path, media_type=content_type)
+        else:
+            task = DOWNLOAD_TASKS.get(file_path, {})
+            logger.warning(f"Terabox file not found: {file_path}, Task status: {task.get('status', 'unknown')}, Error: {task.get('last_error', 'None')}")
+            raise HTTPException(status_code=404, detail=f"File not yet available. Status: {task.get('status', 'unknown')}, Last error: {task.get('last_error', 'None')}")
+    except Exception as e:
+        logger.error(f"Terabox stream error for {link_hash}: {e}")
+        raise HTTPException(status_code=500, detail=f"Stream error: {str(e)}")
 
+# Enhanced status endpoint
 @app.get("/status/{filename}")
 async def check_status(filename: str):
     file_path = os.path.join(DOWNLOAD_DIR, filename)
-    if os.path.exists(file_path):
-        return JSONResponse({"status": "completed"})
-    task = DOWNLOAD_TASKS.get(file_path)
-    if task:
-        return JSONResponse({"status": task["status"], "error": task.get("error")})
-    raise HTTPException(status_code=404, detail="No download task found")
+    try:
+        if os.path.exists(file_path):
+            return JSONResponse({"status": "completed", "retries": 0, "last_error": None})
+        task = DOWNLOAD_TASKS.get(file_path)
+        if task:
+            return JSONResponse({
+                "status": task["status"],
+                "retries": task.get("retries", 0),
+                "last_error": task.get("last_error", None),
+                "url": task.get("url", None)
+            })
+        logger.warning(f"No download task found for {filename}")
+        raise HTTPException(status_code=404, detail="No download task found")
+    except Exception as e:
+        logger.error(f"Status check error for {filename}: {e}")
+        raise HTTPException(status_code=500, detail=f"Status check error: {str(e)}")
 
 # Health check endpoint
 @app.get("/health")
