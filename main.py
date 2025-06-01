@@ -9,6 +9,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from functools import lru_cache
 import logging
+import logging.handlers
 from concurrent.futures import ThreadPoolExecutor
 from aiocache import Cache, cached
 import base64
@@ -36,7 +37,7 @@ BASE_DOMAIN = "https://yt.hosters.club"
 
 # High-performance configuration for 200k daily requests
 MAX_WORKERS = 200  # Increased for your 8-core/16GB setup
-MAX_CONCURRENT_DOWNLOADS = 500  # Parallel downloads
+MAX_CONCURRENT_DOWNLOADS = 50  # Parallel downloads
 DOWNLOAD_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 ACTIVE_DOWNLOADS = set()  # Track active downloads
 
@@ -48,7 +49,12 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler("app.log", mode='a', maxBytes=10*1024*1024, backupCount=3)
+        logging.handlers.RotatingFileHandler(
+            filename="app.log",
+            mode='a',
+            maxBytes=10*1024*1024,  # 10 MB
+            backupCount=3
+        )
     ]
 )
 logger = logging.getLogger(__name__)
@@ -58,9 +64,9 @@ executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 
 # Connection pool for HTTP requests
 connector = aiohttp.TCPConnector(
-    limit=5000,  # Total connection pool size
-    limit_per_host=500,  # Per host
-    ttl_dns_cache=3000,
+    limit=500,  # Total connection pool size
+    limit_per_host=50,  # Per host
+    ttl_dns_cache=300,
     use_dns_cache=True,
     keepalive_timeout=30,
     enable_cleanup_closed=True
