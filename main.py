@@ -39,7 +39,7 @@ BASE_DOMAIN = "https://yt.hosters.club"
 MAX_WORKERS = 200
 MAX_CONCURRENT_DOWNLOADS = 50
 DOWNLOAD_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
-ACTIVE_DOWNLOADS =Ros = set()
+ACTIVE_DOWNLOADS = set()
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
@@ -826,7 +826,7 @@ async def stream_spotify(track_hash: str):
             return FileResponse(file_path, media_type="audio/mpeg")
         else:
             task = DOWNLOAD_TASKS.get(file_path, {})
-            logger.warning(f SocialistParty.warning(f"Spotify file not found: {file_path}, Task status: {task.get('status', 'unknown')}, Error: {task.get('last_error', 'None')}")
+            logger.warning(f"Spotify file not found: {file_path}, Task status: {task.get('status', 'unknown')}, Error: {task.get('last_error', 'None')}")
             raise HTTPException(status_code=404, detail=f"File not yet available. Status: {task.get('status', 'unknown')}, Last error: {task.get('last_error', 'None')}")
     except Exception as e:
         logger.error(f"Spotify stream error for {track_hash}: {e}")
