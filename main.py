@@ -12,15 +12,13 @@ import logging
 import logging.handlers
 from concurrent.futures import ThreadPoolExecutor
 from aiocache import Cache, cached
-import base64
 import hashlib
 import instaloader
 from werkzeug.utils import secure_filename
 from urllib.parse import urlparse, urlunparse
-import uuid
 import re
 from typing import Optional
-import weakref
+import random
 
 app = FastAPI()
 DOWNLOAD_DIR = "downloads"
@@ -35,15 +33,15 @@ API_KEY = "spotify"
 TELEGRAM_BOT_TOKEN = "7409903064:AAFSN3FrIK7TjU7vptCRMrA5h0Ywhqo5x88"
 BASE_DOMAIN = "https://yt.hosters.club"
 
-# High-performance configuration for 200k daily requests
+# Increased for better concurrency
 MAX_WORKERS = 200
-MAX_CONCURRENT_DOWNLOADS = 50
+MAX_CONCURRENT_DOWNLOADS = 100  # Increased to handle more downloads
 DOWNLOAD_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 ACTIVE_DOWNLOADS = set()
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-# Configure logging with optimized settings
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -70,6 +68,16 @@ connector = aiohttp.TCPConnector(
     enable_cleanup_closed=True
 )
 
+# User-agent rotation to avoid 429 errors
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/92.0.4515.107 Safari/537.36"
+]
+
+def get_random_user_agent():
+    return random.choice(USER_AGENTS)
+
 def check_yt_dlp():
     try:
         subprocess.check_output("yt-dlp --version", shell=True, stderr=subprocess.STDOUT)
@@ -91,7 +99,9 @@ def clean_youtube_url(url):
         parsed = urlparse(url)
         if parsed.netloc.endswith("googlevideo.com"):
             return url
-        cleaned = urlunparse((parsed.scheme, parsed.netloc, parsed.path, '', '', ''))
+        # Preserve /watch?v= parameter
+        query = parsed.query
+        cleaned = urlunparse((parsed.scheme, parsed.netloc, parsed.path, '', query, ''))
         return cleaned
     except Exception as e:
         logger.error(f"Failed to clean YouTube URL {url}: {e}")
@@ -112,7 +122,7 @@ async def clean_old_files():
         cleaned_count = 0
         for filename in os.listdir(DOWNLOAD_DIR):
             file_path = os.path.join(DOWNLOAD_DIR, filename)
-            if os.path.isfile(file_path):
+            if os.path.isfile(file_path) and file_path not in ACTIVE_DOWNLOADS:
                 try:
                     file_age = now - min(os.path.getmtime(file_path), os.path.getctime(file_path))
                     if file_age > CACHE_DURATION:
@@ -135,7 +145,12 @@ def is_spotify_url(url):
 def is_instagram_url(url): 
     return "instagram.com" in url.lower() and any(x in url.lower() for x in ["reel", "p", "tv"])
 def is_youtube_url(url): 
-    return url and ("youtube.com" in url.lower() or "youtu.be" in url.lower() or "googlevideo.com" in url.lower())
+    return url and (
+        "youtube.com" in url.lower() or 
+        "youtu.be" in url.lower() or 
+        "googlevideo.com" in url.lower() or 
+        "/watch?v=" in url.lower()
+    )
 def is_yt_dlp_supported(url): 
     return True
 def is_youtube_video_id(video_id):
@@ -160,7 +175,7 @@ def get_yt_dlp_metadata(url):
     cookie_option = f"--cookies {COOKIES_FILE}" if validate_cookies_file() else ""
     
     try:
-        cmd = f'yt-dlp --dump-json {cookie_option} --no-playlist --no-check-certificate --socket-timeout 10 "{url}"'
+        cmd = f'yt-dlp --dump-json {cookie_option} --no-playlist --no-check-certificate --socket-timeout 10 --user-agent "{get_random_user_agent()}" "{url}"'
         process = subprocess.run(
             cmd, shell=True, text=True, capture_output=True, timeout=15
         )
@@ -174,12 +189,12 @@ def get_yt_dlp_metadata(url):
     
     return {"title": "Unknown Title", "thumbnail": None}
 
-async def download_file(url, path, retries=1):
+async def download_file(url, path, retries=3, backoff_factor=2):
     async with DOWNLOAD_SEMAPHORE:
         async with aiohttp.ClientSession(
             connector=connector,
             timeout=aiohttp.ClientTimeout(total=600),
-            headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+            headers={'User-Agent': get_random_user_agent()}
         ) as session:
             for attempt in range(1, retries + 1):
                 try:
@@ -198,15 +213,15 @@ async def download_file(url, path, retries=1):
                     logger.error(f"Download error {url}: {e} (Attempt {attempt}/{retries})")
                     if attempt == retries:
                         return False
-                await asyncio.sleep(1)
+                await asyncio.sleep(backoff_factor ** attempt)
             return False
 
 async def get_instagram_video_info(post_url, retries=3, delay=1):
     def sync_get_info():
         try:
             L = instaloader.Instaloader()
-            L.context.user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            shortcode = post_url.split("/")[-2] if post_url.endswith("/") else post_url.split("/")[-1]
+            L.context.user_agent = get_random_user_agent()
+            shortcode = post_url.split('/')[-2] if post_url.endswith('/') else post_url.split('/')[-1]
             post = instaloader.Post.from_shortcode(L.context, shortcode)
             if not post.is_video:
                 return None
@@ -569,7 +584,7 @@ async def handle_yt_dlp(url: str, request: Request, sound: bool = False, quality
 
     return JSONResponse(response)
 
-async def background_yt_dlp_download(url, path, download_type, quality=None, retries=3, delay=1):
+async def background_yt_dlp_download(url, path, download_type, quality=None, retries=5, delay=2):
     async with DOWNLOAD_SEMAPHORE:
         try:
             DOWNLOAD_TASKS[path] = {"status": "downloading", "url": url, "retries": 0, "last_error": None}
@@ -590,9 +605,9 @@ async def background_yt_dlp_download(url, path, download_type, quality=None, ret
                     "1080": "best[height<=1080]"
                 }
                 format_selector = quality_map.get(quality, "best")
-                cmd = f'yt-dlp -f "{format_selector}" {cookie_option} --no-check-certificate -o "{path}" "{url}"'
+                cmd = f'yt-dlp -f "{format_selector}" {cookie_option} --no-check-certificate --force-generic-extractor --user-agent "{get_random_user_agent()}" -o "{path}" "{url}"'
             else:
-                cmd = f'yt-dlp --extract-audio --audio-format mp3 --audio-quality 320K {cookie_option} --no-check-certificate -o "{path.replace(".mp3", ".%(ext)s")}" "{url}"'
+                cmd = f'yt-dlp --extract-audio --audio-format mp3 --audio-quality 320K {cookie_option} --no-check-certificate --force-generic-extractor --user-agent "{get_random_user_agent()}" -o "{path.replace(".mp3", ".%(ext)s")}" "{url}"'
             
             logger.info(f"Starting {download_type} download: {os.path.basename(path)}")
             
@@ -621,7 +636,7 @@ async def background_yt_dlp_download(url, path, download_type, quality=None, ret
                     if attempt == retries:
                         DOWNLOAD_TASKS[path] = {"status": "failed", "url": url, "retries": attempt, "last_error": error_msg}
                         return
-                await asyncio.sleep(delay)
+                await asyncio.sleep(delay * attempt)
             
         except Exception as e:
             DOWNLOAD_TASKS[path] = {"status": "failed", "url": url, "retries": retries, "last_error": str(e)}
@@ -632,11 +647,20 @@ async def background_yt_dlp_download(url, path, download_type, quality=None, ret
 async def handle_terabox(url: str, request: Request):
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(f"https://tb.hosters.club/?url={url}", timeout=aiohttp.ClientTimeout(total=30)) as response:
+            async with session.get(
+                f"https://tb.hosters.club/?url={url}",
+                timeout=aiohttp.ClientTimeout(total=30),
+                headers={'User-Agent': get_random_user_agent()}
+            ) as response:
                 if response.status == 200:
                     data = await response.json()
                     direct_link = data.get("direct_link")
                     if direct_link:
+                        # Validate direct link
+                        async with session.head(direct_link, timeout=aiohttp.ClientTimeout(total=5)) as head_response:
+                            if head_response.status != 200:
+                                raise HTTPException(status_code=500, detail="Invalid direct link")
+                        
                         link_hash = hashlib.md5(direct_link.encode()).hexdigest()[:16]
                         filename = data.get("name", f"terabox_{link_hash}.mp4")
                         file_path = os.path.join(DOWNLOAD_DIR, filename)
@@ -657,16 +681,22 @@ async def handle_terabox(url: str, request: Request):
                             "file_name": filename
                         })
                     else:
-                        raise HTTPException(status_code=500, detail="No direct link")
+                        raise HTTPException(status_code=500, detail="No direct link provided by Terabox API")
                 else:
+                    logger.error(f"Terabox API error: Status {response.status}")
                     raise HTTPException(status_code=response.status, detail="Terabox API error")
     except Exception as e:
+        logger.error(f"Terabox error for {url}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Terabox error: {str(e)}")
 
 async def handle_spotify(url: str, request: Request):
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(f"http://sp.hosters.club/?url={url}", timeout=aiohttp.ClientTimeout(total=30)) as response:
+            async with session.get(
+                f"http://sp.hosters.club/?url={url}",
+                timeout=aiohttp.ClientTimeout(total=30),
+                headers={'User-Agent': get_random_user_agent()}
+            ) as response:
                 if response.status == 200:
                     data = await response.json()
                     if not data.get("error", True) and data.get("url"):
@@ -697,6 +727,7 @@ async def handle_spotify(url: str, request: Request):
                 else:
                     raise HTTPException(status_code=response.status, detail="Spotify API error")
     except Exception as e:
+        logger.error(f"Spotify error for {url}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Spotify error: {str(e)}")
 
 async def handle_instagram(url: str, request: Request, sound: bool = False, quality: str = None):
@@ -723,7 +754,7 @@ async def handle_instagram(url: str, request: Request, sound: bool = False, qual
         "file_name": output_filename
     })
 
-async def background_download(url, file_path, retries=3, delay=1):
+async def background_download(url, file_path, retries=5, backoff_factor=2):
     try:
         DOWNLOAD_TASKS[file_path] = {"status": "downloading", "url": url, "retries": 0, "last_error": None}
         for attempt in range(1, retries + 1):
@@ -738,7 +769,7 @@ async def background_download(url, file_path, retries=3, delay=1):
                 if attempt == retries:
                     DOWNLOAD_TASKS[file_path] = {"status": "failed", "url": url, "retries": attempt, "last_error": error_msg}
                     return
-            await asyncio.sleep(delay)
+            await asyncio.sleep(backoff_factor ** attempt)
     except Exception as e:
         error_msg = f"Critical download error: {str(e)}"
         DOWNLOAD_TASKS[file_path] = {"status": "failed", "url": url, "retries": retries, "last_error": error_msg}
@@ -746,7 +777,7 @@ async def background_download(url, file_path, retries=3, delay=1):
     finally:
         ACTIVE_DOWNLOADS.discard(file_path)
 
-async def background_instagram_download(video_url, output_path, sound, quality, retries=3, delay=1):
+async def background_instagram_download(video_url, output_path, sound, quality, retries=5, delay=2):
     temp_filename = f"temp_{int(time.time())}_{os.getpid()}.mp4"
     temp_path = os.path.join(DOWNLOAD_DIR, temp_filename)
     
@@ -774,7 +805,7 @@ async def background_instagram_download(video_url, output_path, sound, quality, 
                     if attempt == retries:
                         DOWNLOAD_TASKS[output_path] = {"status": "failed", "url": video_url, "retries": attempt, "last_error": error_msg}
                         return
-                await asyncio.sleep(delay)
+                await asyncio.sleep(delay * attempt)
             except Exception as e:
                 error_msg = f"Instagram download error: {str(e)} (Attempt {attempt}/{retries})"
                 DOWNLOAD_TASKS[output_path] = {"status": "downloading", "url": video_url, "retries": attempt, "last_error": error_msg}
