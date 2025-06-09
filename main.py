@@ -16,7 +16,7 @@ import base64
 import hashlib
 import instaloader
 from werkzeug.utils import secure_filename
-from urllib.parse import urlparse, urlunparse, parse_qs
+from urllib.parse import urlparse, urlunparse
 import uuid
 import re
 from typing import Optional
@@ -31,24 +31,13 @@ SPOTIFY_DOWNLOAD_TASKS = {}
 COOKIES_FILE = "cookies.txt"
 API_KEY = "spotify"
 
-# **PROXY CONFIGURATION**
-PROXY_HOST = "geo.g-w.info"
-PROXY_PORT = "10080"
-PROXY_USERNAME = "GBEwq51G3Yka7aG8"
-PROXY_PASSWORD = "UaIpQH5crfQmmZlQ"
-PROXY_URL = f"http://{PROXY_USERNAME}:{PROXY_PASSWORD}@{PROXY_HOST}:{PROXY_PORT}"
-PROXY_DICT = {
-    'http': PROXY_URL,
-    'https': PROXY_URL
-}
-
 # Telegram Bot Configuration
 TELEGRAM_BOT_TOKEN = "7409903064:AAFSN3FrIK7TjU7vptCRMrA5h0Ywhqo5x88"
 BASE_DOMAIN = "https://yt.hosters.club"
 
 # High-performance configuration for 200k daily requests
 MAX_WORKERS = 200  # Increased for your 8-core/16GB setup
-MAX_CONCURRENT_DOWNLOADS = 50  # Parallel downloads
+MAX_CONCURRENT_DOWNLOADS = 500  # Parallel downloads
 DOWNLOAD_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 ACTIVE_DOWNLOADS = set()  # Track active downloads
 
@@ -73,7 +62,7 @@ logger = logging.getLogger(__name__)
 # Massive executor for high throughput
 executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 
-# **PROXY-ENABLED Connection pool for HTTP requests**
+# Connection pool for HTTP requests
 connector = aiohttp.TCPConnector(
     limit=500,  # Total connection pool size
     limit_per_host=50,  # Per host
@@ -82,8 +71,6 @@ connector = aiohttp.TCPConnector(
     keepalive_timeout=30,
     enable_cleanup_closed=True
 )
-
-logger.info(f"Proxy configured: {PROXY_HOST}:{PROXY_PORT} with user {PROXY_USERNAME}")
 
 # Check if yt-dlp is available
 def check_yt_dlp():
@@ -115,93 +102,16 @@ def clean_youtube_url(url):
         logger.error(f"Failed to clean YouTube URL {url}: {e}")
         return url
 
-# **FIXED Instagram URL Cleaning - Preserves Essential Components**
+# Clean Instagram URL
 def clean_instagram_url(url):
     try:
         parsed = urlparse(url)
-        
-        # Handle different Instagram URL formats
-        if 'instagram.com' not in parsed.netloc.lower():
-            return url
-            
-        # Extract path components
-        path_parts = [part for part in parsed.path.strip('/').split('/') if part]
-        
-        # Handle different Instagram URL patterns
-        if len(path_parts) >= 2:
-            # For URLs like: instagram.com/p/ABC123/, instagram.com/reel/ABC123/, instagram.com/tv/ABC123/
-            if path_parts[0] in ['p', 'reel', 'tv', 'reels']:
-                # Keep the essential path structure
-                clean_path = f"/{path_parts[0]}/{path_parts[1]}/"
-            # For URLs like: instagram.com/username/p/ABC123/
-            elif len(path_parts) >= 3 and path_parts[1] in ['p', 'reel', 'tv']:
-                clean_path = f"/{path_parts[1]}/{path_parts[2]}/"
-            else:
-                # Fallback to original path
-                clean_path = parsed.path
-        else:
-            clean_path = parsed.path
-            
-        # Reconstruct URL with essential components only
-        cleaned = urlunparse((
-            parsed.scheme or 'https',
-            parsed.netloc,
-            clean_path,
-            '',  # params
-            '',  # query - removed for Instagram
-            ''   # fragment
-        ))
-        
-        logger.info(f"Cleaned Instagram URL: {url} -> {cleaned}")
-        return cleaned
-        
+        # Keep only scheme, netloc, and path (remove query parameters)
+        cleaned = urlunparse((parsed.scheme, parsed.netloc, parsed.path, '', '', ''))
+        return cleaned.rstrip('/')
     except Exception as e:
         logger.error(f"Failed to clean Instagram URL {url}: {e}")
         return url
-
-# **ENHANCED Instagram Shortcode Extraction**
-def extract_instagram_shortcode(url):
-    """Enhanced shortcode extraction with multiple pattern support"""
-    try:
-        # Clean the URL first
-        cleaned_url = clean_instagram_url(url)
-        parsed = urlparse(cleaned_url)
-        path_parts = [part for part in parsed.path.strip('/').split('/') if part]
-        
-        # Pattern 1: /p/SHORTCODE/, /reel/SHORTCODE/, /tv/SHORTCODE/
-        if len(path_parts) >= 2 and path_parts[0] in ['p', 'reel', 'tv', 'reels']:
-            shortcode = path_parts[1]
-            logger.info(f"Extracted shortcode (pattern 1): {shortcode} from {url}")
-            return shortcode
-            
-        # Pattern 2: /username/p/SHORTCODE/, /username/reel/SHORTCODE/
-        if len(path_parts) >= 3 and path_parts[1] in ['p', 'reel', 'tv']:
-            shortcode = path_parts[2]
-            logger.info(f"Extracted shortcode (pattern 2): {shortcode} from {url}")
-            return shortcode
-            
-        # Pattern 3: Direct shortcode in URL (fallback)
-        shortcode_pattern = r'/(?:p|reel|tv|reels)/([A-Za-z0-9_-]+)'
-        match = re.search(shortcode_pattern, parsed.path)
-        if match:
-            shortcode = match.group(1)
-            logger.info(f"Extracted shortcode (regex): {shortcode} from {url}")
-            return shortcode
-            
-        # Pattern 4: Alternative regex for edge cases
-        alt_pattern = r'instagram\.com/(?:\w+/)?(?:p|reel|tv|reels)/([A-Za-z0-9_-]+)'
-        match = re.search(alt_pattern, url)
-        if match:
-            shortcode = match.group(1)
-            logger.info(f"Extracted shortcode (alt regex): {shortcode} from {url}")
-            return shortcode
-            
-        logger.error(f"Could not extract shortcode from URL: {url}")
-        return None
-        
-    except Exception as e:
-        logger.error(f"Error extracting shortcode from {url}: {e}")
-        return None
 
 # Optimized file cleanup for high volume
 async def clean_old_files():
@@ -228,23 +138,15 @@ async def clean_old_files():
     if cleaned > 0:
         logger.info(f"Cleaned {cleaned} old files")
 
-# URL type detection with enhanced Instagram detection
+# URL type detection
 def is_terabox_url(url): 
     return any(domain in url.lower() for domain in ["terabox.com", "1024tera.com", "terabox.app", "terabox.club"])
-
 def is_spotify_url(url): 
     return "spotify.com" in url.lower()
-
 def is_instagram_url(url): 
-    """Enhanced Instagram URL detection"""
-    if "instagram.com" not in url.lower():
-        return False
-    # Check for content type indicators
-    return any(indicator in url.lower() for indicator in ["reel", "/p/", "/tv/", "reels"])
-
+    return "instagram.com" in url.lower() and any(x in url.lower() for x in ["reel", "p", "tv"])
 def is_youtube_url(url): 
     return url and ("youtube.com" in url.lower() or "youtu.be" in url.lower() or "googlevideo.com" in url.lower())
-
 def is_yt_dlp_supported(url): 
     return True
 
@@ -262,18 +164,16 @@ def get_unique_filename(url, quality=None, sound=False):
 def validate_cookies_file():
     return os.path.exists(COOKIES_FILE) and os.path.getsize(COOKIES_FILE) > 0
 
-# **PROXY-ENABLED metadata extraction**
+# Optimized metadata extraction
 @lru_cache(maxsize=2000)  # Increased cache size
 def get_yt_dlp_metadata(url):
     if not check_yt_dlp():
         return {"title": "Unknown Title", "thumbnail": None}
     
     cookie_option = f"--cookies {COOKIES_FILE}" if validate_cookies_file() else ""
-    proxy_option = f"--proxy {PROXY_URL}"
     
     try:
-        cmd = f'yt-dlp --dump-json {cookie_option} {proxy_option} --no-playlist --no-check-certificate --socket-timeout 10 "{url}"'
-        logger.info(f"Getting metadata with proxy: {PROXY_HOST}:{PROXY_PORT}")
+        cmd = f'yt-dlp --dump-json {cookie_option} --no-playlist --no-check-certificate --socket-timeout 10 "{url}"'
         process = subprocess.run(
             cmd, shell=True, text=True, capture_output=True, timeout=15
         )
@@ -287,33 +187,22 @@ def get_yt_dlp_metadata(url):
     
     return {"title": "Unknown Title", "thumbnail": None}
 
-# **PROXY-ENABLED High-performance file download with retries**
-async def download_file(url, path, retries=3):
+# High-performance file download with retries
+async def download_file(url, path, retries=1):
     async with DOWNLOAD_SEMAPHORE:  # Limit concurrent downloads
-        # Create proxy connector
-        proxy_connector = aiohttp.TCPConnector(
-            limit=100,
-            limit_per_host=10,
-            ttl_dns_cache=300,
-            use_dns_cache=True,
-            keepalive_timeout=30,
-            enable_cleanup_closed=True
-        )
-        
         async with aiohttp.ClientSession(
-            connector=proxy_connector,
+            connector=connector,
             timeout=aiohttp.ClientTimeout(total=600),
             headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
         ) as session:
             for attempt in range(1, retries + 1):
                 try:
-                    logger.info(f"Downloading via proxy: {PROXY_HOST}:{PROXY_PORT}")
-                    async with session.get(url, proxy=PROXY_URL) as response:
+                    async with session.get(url) as response:
                         if response.status == 200:
                             async with aiofiles.open(path, "wb") as f:
                                 async for chunk in response.content.iter_chunked(16384):  # Larger chunks
                                     await f.write(chunk)
-                            logger.info(f"Downloaded via proxy: {os.path.basename(path)}")
+                            logger.info(f"Downloaded: {os.path.basename(path)}")
                             return True
                         else:
                             logger.error(f"Download failed {url}: Status {response.status} (Attempt {attempt}/{retries})")
@@ -326,125 +215,48 @@ async def download_file(url, path, retries=3):
                 await asyncio.sleep(1)
             return False
 
-# **PROXY-ENABLED Instagram info extraction with retries**
-async def get_instagram_video_info(post_url, retries=3, delay=2):
-    """Enhanced Instagram video info extraction with proxy support"""
-    
-    def sync_get_info_method1():
-        """Primary method using instaloader with proxy"""
+# Instagram info extraction with retries
+async def get_instagram_video_info(post_url, retries=3, delay=1):
+    def sync_get_info():
         try:
-            # Extract shortcode using enhanced function
-            shortcode = extract_instagram_shortcode(post_url)
-            if not shortcode:
-                logger.error(f"Could not extract shortcode from {post_url}")
-                return None
-                
-            logger.info(f"Attempting to get Instagram info for shortcode: {shortcode} via proxy")
-            
-            # Initialize instaloader with proxy settings
-            L = instaloader.Instaloader(
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-                request_timeout=30,
-                max_connection_attempts=3
-            )
-            
-            # Configure proxy for instaloader
-            L.context.session.proxies = PROXY_DICT
-            L.context.query_timestamps = False
-            L.context.log = lambda *args: None  # Disable logging
-            
-            post = instaloader.Post.from_shortcode(L.context, shortcode)
-            
-            # Extract information
-            caption = post.caption or f"Instagram_{shortcode}"
-            # Clean caption for filename
-            cleaned_caption = re.sub(r'[#@]\w+', '', caption)
-            cleaned_caption = re.sub(r'\s+', ' ', cleaned_caption).strip()
-            cleaned_caption = re.sub(r'[^\w\s-]', '', cleaned_caption)[:50]
-            
-            info = {
-                "video_url": post.video_url if post.is_video else None,
-                "title": cleaned_caption if cleaned_caption else f"Instagram_{shortcode}",
-                "thumbnail": post.url,
-                "shortcode": shortcode,
-                "is_video": post.is_video
-            }
-            
-            if not info["video_url"]:
-                logger.warning(f"No video URL found for {shortcode}")
-                return None
-                
-            logger.info(f"Successfully extracted Instagram info for {shortcode} via proxy")
-            return info
-            
-        except Exception as e:
-            logger.error(f"Method 1 failed for {post_url}: {e}")
-            return None
-    
-    def sync_get_info_method2():
-        """Fallback method with different instaloader configuration"""
-        try:
-            shortcode = extract_instagram_shortcode(post_url)
-            if not shortcode:
-                return None
-                
-            # Try with minimal instaloader setup
             L = instaloader.Instaloader()
-            L.context.user_agent = 'Instagram 76.0.0.15.395 Android'
-            L.context.session.proxies = PROXY_DICT
-            
+            L.context.user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            shortcode = post_url.split("/")[-2] if post_url.endswith("/") else post_url.split("/")[-1]
             post = instaloader.Post.from_shortcode(L.context, shortcode)
-            
-            if post.is_video and post.video_url:
-                return {
-                    "video_url": post.video_url,
-                    "title": f"Instagram_Video_{shortcode}",
-                    "thumbnail": post.url,
-                    "shortcode": shortcode,
-                    "is_video": True
-                }
-            return None
-            
+            return {
+                "video_url": post.video_url if post.is_video else None,
+                "title": (post.caption or f"Instagram_{shortcode}")[:100],
+                "thumbnail": post.url
+            }
         except Exception as e:
-            logger.error(f"Method 2 failed for {post_url}: {e}")
+            logger.error(f"Instagram info error: {e}")
             return None
     
-    # Try multiple methods with retries
     for attempt in range(1, retries + 1):
-        logger.info(f"Instagram info extraction attempt {attempt}/{retries} for {post_url} via proxy")
-        
-        # Try method 1
         try:
-            result = await asyncio.get_event_loop().run_in_executor(executor, sync_get_info_method1)
-            if result and result.get("video_url"):
+            result = await asyncio.get_event_loop().run_in_executor(executor, sync_get_info)
+            if result:
                 return result
-        except Exception as e:
-            logger.error(f"Method 1 exception: {e}")
-        
-        # Try method 2
-        try:
-            result = await asyncio.get_event_loop().run_in_executor(executor, sync_get_info_method2)
-            if result and result.get("video_url"):
-                return result
-        except Exception as e:
-            logger.error(f"Method 2 exception: {e}")
-        
-        if attempt < retries:
-            logger.warning(f"All methods failed for {post_url}, retrying in {delay}s...")
+            logger.warning(f"Failed to get Instagram info for {post_url} (Attempt {attempt}/{retries})")
+            if attempt == retries:
+                return None
             await asyncio.sleep(delay)
-    
-    logger.error(f"All extraction methods failed for {post_url}")
+        except Exception as e:
+            logger.error(f"Instagram info error for {post_url}: {e} (Attempt {attempt}/{retries})")
+            if attempt == retries:
+                return None
+            await asyncio.sleep(delay)
     return None
 
-# Enhanced Instagram processing with better error handling
+# Enhanced Instagram processing
 async def process_instagram_video(temp_path, output_path, sound=False, quality=None):
     if not check_ffmpeg():
         raise HTTPException(status_code=500, detail="ffmpeg not available")
     
     try:
         if sound:
-            # Enhanced MP3 conversion with better quality
-            cmd = f'ffmpeg -i "{temp_path}" -vn -acodec libmp3lame -b:a 320k -ar 44100 -ac 2 -metadata title="Instagram Audio" "{output_path}" -y -loglevel error'
+            # Fixed MP3 command with proper audio codec
+            cmd = f'ffmpeg -i "{temp_path}" -vn -acodec libmp3lame -b:a 320k -ar 44100 -ac 2 "{output_path}" -y -loglevel error'
         else:
             if quality:
                 resolution_map = {
@@ -452,36 +264,26 @@ async def process_instagram_video(temp_path, output_path, sound=False, quality=N
                     "360": "640:360", "240": "426:240"
                 }
                 res = resolution_map.get(quality, "1280:720")
-                cmd = f'ffmpeg -i "{temp_path}" -vf "scale={res}:force_original_aspect_ratio=decrease:force_divisible_by=2,pad={res}:(ow-iw)/2:(oh-ih)/2" -c:v libx264 -preset medium -crf 23 -c:a aac -b:a 128k "{output_path}" -y -loglevel error'
+                cmd = f'ffmpeg -i "{temp_path}" -vf "scale={res}:force_original_aspect_ratio=decrease:force_divisible_by=2" -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 128k "{output_path}" -y -loglevel error'
             else:
-                # Default high-quality conversion
-                cmd = f'ffmpeg -i "{temp_path}" -c:v libx264 -preset medium -crf 20 -c:a aac -b:a 192k -movflags +faststart "{output_path}" -y -loglevel error'
-        
-        logger.info(f"Processing Instagram video with command: {cmd}")
+                cmd = f'ffmpeg -i "{temp_path}" -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 128k "{output_path}" -y -loglevel error'
         
         process = await asyncio.create_subprocess_shell(
-            cmd, 
-            stdout=asyncio.subprocess.PIPE, 
-            stderr=asyncio.subprocess.PIPE
+            cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
         )
-        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=300)
+        stdout, stderr = await process.communicate()
         
         if process.returncode == 0:
-            logger.info(f"Successfully processed Instagram video: {os.path.basename(output_path)}")
+            logger.info(f"Processed Instagram video: {os.path.basename(output_path)}")
             return True
         else:
-            error_msg = stderr.decode()
-            logger.error(f"ffmpeg processing failed: {error_msg}")
+            logger.error(f"ffmpeg failed: {stderr.decode()}")
             return False
-            
-    except asyncio.TimeoutError:
-        logger.error("Instagram video processing timed out")
-        return False
     except Exception as e:
         logger.error(f"Instagram processing error: {e}")
         return False
 
-# Telegram functions with proxy support
+# Telegram functions
 def extract_urls_from_text(text):
     url_pattern = r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+'
     urls = re.findall(url_pattern, text)
@@ -491,7 +293,6 @@ def extract_urls_from_text(text):
         urls = [f"https://{url}" if not url.startswith(('http://', 'https://')) else url for url in potential_urls]
     return urls
 
-# **PROXY-ENABLED Telegram functions**
 async def send_telegram_message(chat_id, text, reply_markup=None):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     data = {
@@ -504,7 +305,7 @@ async def send_telegram_message(chat_id, text, reply_markup=None):
     
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=data, proxy=PROXY_URL, timeout=aiohttp.ClientTimeout(total=10)) as response:
+            async with session.post(url, json=data, timeout=aiohttp.ClientTimeout(total=10)) as response:
                 return await response.json()
     except Exception as e:
         logger.error(f"Telegram send error: {e}")
@@ -522,7 +323,7 @@ async def send_telegram_photo(chat_id, photo_url, caption, reply_markup=None):
     
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=data, proxy=PROXY_URL, timeout=aiohttp.ClientTimeout(total=10)) as response:
+            async with session.post(url, json=data, timeout=aiohttp.ClientTimeout(total=10)) as response:
                 return await response.json()
     except:
         await send_telegram_message(chat_id, caption, reply_markup)
@@ -537,7 +338,7 @@ def create_inline_keyboard(mp4_url=None, mp3_url=None, direct_link=None):
         keyboard.append([{"text": "📥 Direct Download", "url": direct_link}])
     return {"inline_keyboard": keyboard}
 
-# **PROXY-ENABLED Telegram Webhook Handler**
+# Telegram Webhook Handler with improved error feedback
 @app.post("/telegram_webhook")
 async def telegram_webhook(request: Request):
     try:
@@ -560,7 +361,6 @@ async def telegram_webhook(request: Request):
 • YouTube • Instagram • Spotify • Terabox • And many more!
 
 ⚡ <b>Downloads are processed in background for maximum speed!</b>
-🌐 <b>Using high-speed proxy for optimal performance!</b>
 
 👨‍💻 Developer: @SUN_GOD_LUFFYY
             """
@@ -575,14 +375,14 @@ async def telegram_webhook(request: Request):
                 try:
                     await send_telegram_message(
                         chat_id, 
-                        f"🔄 Processing your URL via proxy...\n<code>{url}</code>"
+                        f"🔄 Processing your URL...\n<code>{url}</code>"
                     )
                     
-                    # Make non-blocking request to API with proxy
+                    # Make non-blocking request to API
                     api_url = f"{BASE_DOMAIN}/?url={url}"
                     
                     async with aiohttp.ClientSession() as session:
-                        async with session.get(api_url, proxy=PROXY_URL, timeout=aiohttp.ClientTimeout(total=30)) as response:
+                        async with session.get(api_url, timeout=aiohttp.ClientTimeout(total=30)) as response:
                             if response.status == 200:
                                 data = await response.json()
                                 
@@ -593,7 +393,7 @@ async def telegram_webhook(request: Request):
                                 direct_link = data.get("link")
                                 
                                 response_text = f"""
-✅ <b>Processing started via proxy!</b>
+✅ <b>Processing started!</b>
 
 📝 <b>Title:</b> {title[:100]}{"..." if len(title) > 100 else ""}
 
@@ -601,7 +401,6 @@ async def telegram_webhook(request: Request):
 🎵 <b>Audio:</b> {"✅ Available" if mp3_url else "❌ Not available"}
 
 ⚡ <b>Downloads are running in background!</b>
-🌐 <b>Proxy:</b> Active
 """
                                 
                                 if is_terabox_url(url):
@@ -635,7 +434,7 @@ async def telegram_webhook(request: Request):
         else:
             await send_telegram_message(
                 chat_id,
-                "📎 Please send a valid URL!\n\n✅ Supported: YouTube, Instagram (reels, posts, IGTV), Spotify, Terabox, and more!\n🌐 Proxy: Active\n\n👨‍💻 Dev: @SUN_GOD_LUFFYY"
+                "📎 Please send a valid URL!\n\n✅ Supported: YouTube, Instagram (reels, posts, IGTV), Spotify, Terabox, and more!\n\n👨‍💻 Dev: @SUN_GOD_LUFFYY"
             )
         
         return JSONResponse({"ok": True})
@@ -644,7 +443,7 @@ async def telegram_webhook(request: Request):
         logger.error(f"Telegram webhook error: {e}")
         return JSONResponse({"ok": True})
 
-# Main endpoint - NON-BLOCKING with background downloads and proxy
+# Main endpoint - NON-BLOCKING with background downloads
 @app.get("/")
 async def download_video(request: Request):
     # Non-blocking cleanup
@@ -663,14 +462,12 @@ async def download_video(request: Request):
         else:
             raise HTTPException(status_code=400, detail="Invalid URL format")
 
-    # **Enhanced URL cleaning for Instagram**
     if is_instagram_url(url):
-        url = clean_instagram_url(url)  # Fixed Instagram URL cleaning
-        logger.info(f"Cleaned Instagram URL: {url}")
+        url = clean_instagram_url(url)  # Clean Instagram URL
     elif is_youtube_url(url):
         url = clean_youtube_url(url)
 
-    logger.info(f"Processing URL via proxy {PROXY_HOST}:{PROXY_PORT}: {url}")
+    logger.info(f"Processing URL: {url}")
 
     if is_spotify_url(url):
         if sound or quality:
@@ -689,7 +486,7 @@ async def download_video(request: Request):
     else:
         raise HTTPException(status_code=400, detail="Unsupported URL type")
 
-# **PROXY-ENABLED yt-dlp handler**
+# BACKGROUND yt-dlp handler (non-blocking)
 async def handle_yt_dlp(url: str, request: Request, sound: bool = False, quality: str = None):
     if is_youtube_url(url):
         url = clean_youtube_url(url)
@@ -704,7 +501,7 @@ async def handle_yt_dlp(url: str, request: Request, sound: bool = False, quality
         video_path = os.path.join(DOWNLOAD_DIR, video_filename)
         audio_path = os.path.join(DOWNLOAD_DIR, audio_filename)
         
-        # Start BACKGROUND downloads with proxy
+        # Start BACKGROUND downloads
         if video_path not in ACTIVE_DOWNLOADS:
             ACTIVE_DOWNLOADS.add(video_path)
             asyncio.create_task(background_yt_dlp_download(url, video_path, "video", "1080"))
@@ -732,13 +529,12 @@ async def handle_yt_dlp(url: str, request: Request, sound: bool = False, quality
         "stream_mp4": f"{base_url}/stream/{video_filename}" if video_filename else None,
         "stream_mp3": f"{base_url}/stream/{audio_filename}" if audio_filename else None,
         "file_name_mp4": video_filename,
-        "file_name_mp3": audio_filename,
-        "proxy_enabled": True
+        "file_name_mp3": audio_filename
     }
 
     return JSONResponse(response)
 
-# **PROXY-ENABLED background yt-dlp download with retries**
+# FIXED background yt-dlp download with retries
 async def background_yt_dlp_download(url, path, download_type, quality=None, retries=3, delay=1):
     async with DOWNLOAD_SEMAPHORE:
         try:
@@ -750,7 +546,6 @@ async def background_yt_dlp_download(url, path, download_type, quality=None, ret
                 return
 
             cookie_option = f"--cookies {COOKIES_FILE}" if validate_cookies_file() else ""
-            proxy_option = f"--proxy {PROXY_URL}"
             
             if download_type == "video":
                 quality_map = {
@@ -761,11 +556,11 @@ async def background_yt_dlp_download(url, path, download_type, quality=None, ret
                     "1080": "best[height<=1080]"
                 }
                 format_selector = quality_map.get(quality, "best")
-                cmd = f'yt-dlp -f "{format_selector}" {cookie_option} {proxy_option} --no-check-certificate -o "{path}" "{url}"'
+                cmd = f'yt-dlp -f "{format_selector}" {cookie_option} --no-check-certificate -o "{path}" "{url}"'
             else:
-                cmd = f'yt-dlp --extract-audio --audio-format mp3 --audio-quality 320K {cookie_option} {proxy_option} --no-check-certificate -o "{path.replace(".mp3", ".%(ext)s")}" "{url}"'
+                cmd = f'yt-dlp --extract-audio --audio-format mp3 --audio-quality 320K {cookie_option} --no-check-certificate -o "{path.replace(".mp3", ".%(ext)s")}" "{url}"'
             
-            logger.info(f"Starting {download_type} download via proxy: {os.path.basename(path)}")
+            logger.info(f"Starting {download_type} download: {os.path.basename(path)}")
             
             def run_download():
                 return subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=1800)
@@ -776,19 +571,19 @@ async def background_yt_dlp_download(url, path, download_type, quality=None, ret
                     
                     if process.returncode == 0:
                         DOWNLOAD_TASKS[path] = {"status": "completed", "url": url, "retries": attempt - 1}
-                        logger.info(f"Completed {download_type} download via proxy: {os.path.basename(path)}")
+                        logger.info(f"Completed {download_type} download: {os.path.basename(path)}")
                         return
                     else:
                         error_msg = process.stderr[:500]  # Limit error message length
                         DOWNLOAD_TASKS[path] = {"status": "downloading", "url": url, "retries": attempt, "last_error": error_msg}
-                        logger.error(f"Download failed for {url} via proxy: {error_msg} (Attempt {attempt}/{retries})")
+                        logger.error(f"Download failed for {url}: {error_msg} (Attempt {attempt}/{retries})")
                         if attempt == retries:
                             DOWNLOAD_TASKS[path] = {"status": "failed", "url": url, "retries": attempt, "last_error": error_msg}
                             return
                 except Exception as e:
                     error_msg = str(e)
                     DOWNLOAD_TASKS[path] = {"status": "downloading", "url": url, "retries": attempt, "last_error": error_msg}
-                    logger.error(f"Download error for {url} via proxy: {e} (Attempt {attempt}/{retries})")
+                    logger.error(f"Download error for {url}: {e} (Attempt {attempt}/{retries})")
                     if attempt == retries:
                         DOWNLOAD_TASKS[path] = {"status": "failed", "url": url, "retries": attempt, "last_error": error_msg}
                         return
@@ -796,15 +591,15 @@ async def background_yt_dlp_download(url, path, download_type, quality=None, ret
             
         except Exception as e:
             DOWNLOAD_TASKS[path] = {"status": "failed", "url": url, "retries": retries, "last_error": str(e)}
-            logger.error(f"Critical download error for {url} via proxy: {e}")
+            logger.error(f"Critical download error for {url}: {e}")
         finally:
             ACTIVE_DOWNLOADS.discard(path)
 
-# **PROXY-ENABLED Terabox handler**
+# BACKGROUND Terabox handler
 async def handle_terabox(url: str, request: Request):
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(f"https://tb.hosters.club/?url={url}", proxy=PROXY_URL, timeout=aiohttp.ClientTimeout(total=30)) as response:
+            async with session.get(f"https://tb.hosters.club/?url={url}", timeout=aiohttp.ClientTimeout(total=30)) as response:
                 if response.status == 200:
                     data = await response.json()
                     direct_link = data.get("direct_link")
@@ -815,7 +610,7 @@ async def handle_terabox(url: str, request: Request):
                         
                         TERABOX_LINKS[link_hash] = {"link": direct_link, "name": filename}
                         
-                        # Start BACKGROUND download with proxy
+                        # Start BACKGROUND download
                         if file_path not in ACTIVE_DOWNLOADS:
                             ACTIVE_DOWNLOADS.add(file_path)
                             asyncio.create_task(background_download(direct_link, file_path))
@@ -827,8 +622,7 @@ async def handle_terabox(url: str, request: Request):
                             "link": direct_link,
                             "stream_mp4": f"{base_url}/tb/{link_hash}",
                             "stream_mp3": None,
-                            "file_name": filename,
-                            "proxy_enabled": True
+                            "file_name": filename
                         })
                     else:
                         raise HTTPException(status_code=500, detail="No direct link")
@@ -837,11 +631,11 @@ async def handle_terabox(url: str, request: Request):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Terabox error: {str(e)}")
 
-# **PROXY-ENABLED Spotify handler**
+# BACKGROUND Spotify handler
 async def handle_spotify(url: str, request: Request):
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(f"http://sp.hosters.club/?url={url}", proxy=PROXY_URL, timeout=aiohttp.ClientTimeout(total=30)) as response:
+            async with session.get(f"http://sp.hosters.club/?url={url}", timeout=aiohttp.ClientTimeout(total=30)) as response:
                 if response.status == 200:
                     data = await response.json()
                     if not data.get("error", True) and data.get("url"):
@@ -854,7 +648,7 @@ async def handle_spotify(url: str, request: Request):
                             "link": track_url, "name": filename, "file_path": file_path
                         }
 
-                        # Start BACKGROUND download with proxy
+                        # Start BACKGROUND download
                         if file_path not in ACTIVE_DOWNLOADS:
                             ACTIVE_DOWNLOADS.add(file_path)
                             asyncio.create_task(background_download(track_url, file_path))
@@ -866,8 +660,7 @@ async def handle_spotify(url: str, request: Request):
                             "link": track_url,
                             "stream_mp4": None,
                             "stream_mp3": f"{base_url}/spotify/{track_hash}",
-                            "file_name": filename,
-                            "proxy_enabled": True
+                            "file_name": filename
                         })
                     else:
                         raise HTTPException(status_code=500, detail="Spotify API error")
@@ -876,61 +669,43 @@ async def handle_spotify(url: str, request: Request):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Spotify error: {str(e)}")
 
-# **ENHANCED Instagram handler with proxy support**
+# BACKGROUND Instagram handler
 async def handle_instagram(url: str, request: Request, sound: bool = False, quality: str = None):
-    # Enhanced Instagram processing with proxy
-    logger.info(f"Handling Instagram URL via proxy: {url}")
-    
-    # Try to get Instagram video info with enhanced extraction and proxy
     info = await get_instagram_video_info(url)
-    
-    if not info:
-        error_msg = f"Failed to extract Instagram video info from URL: {url}"
-        logger.error(error_msg)
-        raise HTTPException(status_code=400, detail=error_msg)
-    
-    if not info.get("video_url"):
-        error_msg = f"No video content found in Instagram post: {url}"
+    if not info or not info["video_url"]:
+        error_msg = f"Invalid Instagram URL or no video found: {url}"
         logger.error(error_msg)
         raise HTTPException(status_code=400, detail=error_msg)
 
-    # Generate output filename
     output_filename = get_unique_filename(url, quality or "original", sound)
     output_path = os.path.join(DOWNLOAD_DIR, output_filename)
 
-    # Start BACKGROUND download with proxy
+    # Start BACKGROUND download
     if output_path not in ACTIVE_DOWNLOADS:
         ACTIVE_DOWNLOADS.add(output_path)
-        asyncio.create_task(background_instagram_download(info["video_url"], output_path, sound, quality, info.get("title", "Instagram Video")))
+        asyncio.create_task(background_instagram_download(info["video_url"], output_path, sound, quality))
 
     base_url = str(request.base_url).rstrip('/')
-    
-    # Return response immediately while download happens in background
-    response = {
+    return JSONResponse({
         "title": info["title"],
         "thumbnail": info["thumbnail"],
         "link": info["video_url"],
         "stream_mp4": f"{base_url}/stream/{output_filename}" if not sound else None,
         "stream_mp3": f"{base_url}/stream/{output_filename}" if sound else None,
-        "file_name": output_filename,
-        "shortcode": info.get("shortcode", "unknown"),
-        "proxy_enabled": True
-    }
-    
-    logger.info(f"Instagram response prepared for {url}: {response}")
-    return JSONResponse(response)
+        "file_name": output_filename
+    })
 
-# **PROXY-ENABLED background download functions**
+# BACKGROUND download functions with retries
 async def background_download(url, file_path, retries=3, delay=1):
     try:
         DOWNLOAD_TASKS[file_path] = {"status": "downloading", "url": url, "retries": 0, "last_error": None}
         for attempt in range(1, retries + 1):
             if await download_file(url, file_path, retries=1):
                 DOWNLOAD_TASKS[file_path] = {"status": "completed", "url": url, "retries": attempt - 1}
-                logger.info(f"Completed download via proxy: {os.path.basename(file_path)}")
+                logger.info(f"Completed download: {os.path.basename(file_path)}")
                 return
             else:
-                error_msg = f"Failed to download {url} via proxy (Attempt {attempt}/{retries})"
+                error_msg = f"Failed to download {url} (Attempt {attempt}/{retries})"
                 DOWNLOAD_TASKS[file_path] = {"status": "downloading", "url": url, "retries": attempt, "last_error": error_msg}
                 logger.error(error_msg)
                 if attempt == retries:
@@ -940,127 +715,59 @@ async def background_download(url, file_path, retries=3, delay=1):
     except Exception as e:
         error_msg = f"Critical download error: {str(e)}"
         DOWNLOAD_TASKS[file_path] = {"status": "failed", "url": url, "retries": retries, "last_error": error_msg}
-        logger.error(f"Download error for {url} via proxy: {e}")
+        logger.error(f"Download error for {url}: {e}")
     finally:
         ACTIVE_DOWNLOADS.discard(file_path)
 
-# **PROXY-ENABLED Instagram background download**
-async def background_instagram_download(video_url, output_path, sound, quality, title="Instagram Video", retries=3, delay=2):
-    temp_filename = f"temp_ig_{int(time.time())}_{os.getpid()}.mp4"
+async def background_instagram_download(video_url, output_path, sound, quality, retries=3, delay=1):
+    temp_filename = f"temp_{int(time.time())}_{os.getpid()}.mp4"
     temp_path = os.path.join(DOWNLOAD_DIR, temp_filename)
     
     try:
-        DOWNLOAD_TASKS[output_path] = {
-            "status": "downloading", 
-            "url": video_url, 
-            "retries": 0, 
-            "last_error": None,
-            "title": title
-        }
-        
-        logger.info(f"Starting Instagram download via proxy: {title}")
+        DOWNLOAD_TASKS[output_path] = {"status": "downloading", "url": video_url, "retries": 0, "last_error": None}
         
         for attempt in range(1, retries + 1):
             try:
-                # Download the original video file via proxy
-                logger.info(f"Downloading Instagram video via proxy (attempt {attempt}/{retries}): {video_url}")
-                
-                if await download_file(video_url, temp_path, retries=2):
-                    logger.info(f"Instagram video downloaded via proxy successfully, processing...")
-                    
-                    # Process the video (convert/optimize)
+                if await download_file(video_url, temp_path, retries=1):
                     if await process_instagram_video(temp_path, output_path, sound, quality):
-                        DOWNLOAD_TASKS[output_path] = {
-                            "status": "completed", 
-                            "url": video_url, 
-                            "retries": attempt - 1,
-                            "title": title
-                        }
-                        logger.info(f"Completed Instagram processing via proxy: {os.path.basename(output_path)}")
+                        DOWNLOAD_TASKS[output_path] = {"status": "completed", "url": video_url, "retries": attempt - 1}
+                        logger.info(f"Completed Instagram download: {os.path.basename(output_path)}")
                         return
                     else:
-                        error_msg = f"Instagram video processing failed for {video_url} (Attempt {attempt}/{retries})"
-                        DOWNLOAD_TASKS[output_path] = {
-                            "status": "processing", 
-                            "url": video_url, 
-                            "retries": attempt, 
-                            "last_error": error_msg,
-                            "title": title
-                        }
+                        error_msg = f"Instagram processing failed for {video_url} (Attempt {attempt}/{retries})"
+                        DOWNLOAD_TASKS[output_path] = {"status": "downloading", "url": video_url, "retries": attempt, "last_error": error_msg}
                         logger.error(error_msg)
                         if attempt == retries:
-                            DOWNLOAD_TASKS[output_path] = {
-                                "status": "failed", 
-                                "url": video_url, 
-                                "retries": attempt, 
-                                "last_error": error_msg,
-                                "title": title
-                            }
+                            DOWNLOAD_TASKS[output_path] = {"status": "failed", "url": video_url, "retries": attempt, "last_error": error_msg}
                             return
                 else:
-                    error_msg = f"Instagram video download failed for {video_url} via proxy (Attempt {attempt}/{retries})"
-                    DOWNLOAD_TASKS[output_path] = {
-                        "status": "downloading", 
-                        "url": video_url, 
-                        "retries": attempt, 
-                        "last_error": error_msg,
-                        "title": title
-                    }
+                    error_msg = f"Instagram download failed for {video_url} (Attempt {attempt}/{retries})"
+                    DOWNLOAD_TASKS[output_path] = {"status": "downloading", "url": video_url, "retries": attempt, "last_error": error_msg}
                     logger.error(error_msg)
                     if attempt == retries:
-                        DOWNLOAD_TASKS[output_path] = {
-                            "status": "failed", 
-                            "url": video_url, 
-                            "retries": attempt, 
-                            "last_error": error_msg,
-                            "title": title
-                        }
+                        DOWNLOAD_TASKS[output_path] = {"status": "failed", "url": video_url, "retries": attempt, "last_error": error_msg}
                         return
-                        
-                if attempt < retries:
-                    await asyncio.sleep(delay)
-                    
+                await asyncio.sleep(delay)
             except Exception as e:
-                error_msg = f"Instagram download error via proxy: {str(e)} (Attempt {attempt}/{retries})"
-                DOWNLOAD_TASKS[output_path] = {
-                    "status": "error", 
-                    "url": video_url, 
-                    "retries": attempt, 
-                    "last_error": error_msg,
-                    "title": title
-                }
+                error_msg = f"Instagram download error: {str(e)} (Attempt {attempt}/{retries})"
+                DOWNLOAD_TASKS[output_path] = {"status": "downloading", "url": video_url, "retries": attempt, "last_error": error_msg}
                 logger.error(error_msg)
                 if attempt == retries:
-                    DOWNLOAD_TASKS[output_path] = {
-                        "status": "failed", 
-                        "url": video_url, 
-                        "retries": attempt, 
-                        "last_error": error_msg,
-                        "title": title
-                    }
+                    DOWNLOAD_TASKS[output_path] = {"status": "failed", "url": video_url, "retries": attempt, "last_error": error_msg}
                     return
-                    
     except Exception as e:
-        error_msg = f"Critical Instagram download error via proxy: {str(e)}"
-        DOWNLOAD_TASKS[output_path] = {
-            "status": "failed", 
-            "url": video_url, 
-            "retries": retries, 
-            "last_error": error_msg,
-            "title": title
-        }
+        error_msg = f"Critical Instagram download error: {str(e)}"
+        DOWNLOAD_TASKS[output_path] = {"status": "failed", "url": video_url, "retries": retries, "last_error": error_msg}
         logger.error(error_msg)
     finally:
         ACTIVE_DOWNLOADS.discard(output_path)
-        # Clean up temporary file
         if os.path.exists(temp_path):
             try:
                 os.remove(temp_path)
-                logger.info(f"Cleaned up temp file: {temp_filename}")
-            except Exception as e:
-                logger.warning(f"Failed to clean up temp file {temp_filename}: {e}")
+            except:
+                pass
 
-# Streaming endpoints (unchanged but with proxy logging)
+# Streaming endpoints with enhanced stability
 @app.get("/stream/{filename}")
 async def stream_file(filename: str):
     file_path = os.path.join(DOWNLOAD_DIR, filename)
@@ -1122,22 +829,20 @@ async def stream_terabox(link_hash: str):
         logger.error(f"Terabox stream error for {link_hash}: {e}")
         raise HTTPException(status_code=500, detail=f"Stream error: {str(e)}")
 
-# Enhanced status endpoint with proxy info
+# Enhanced status endpoint
 @app.get("/status/{filename}")
 async def check_status(filename: str):
     file_path = os.path.join(DOWNLOAD_DIR, filename)
     try:
         if os.path.exists(file_path):
-            return JSONResponse({"status": "completed", "retries": 0, "last_error": None, "proxy_enabled": True})
+            return JSONResponse({"status": "completed", "retries": 0, "last_error": None})
         task = DOWNLOAD_TASKS.get(file_path)
         if task:
             return JSONResponse({
                 "status": task["status"],
                 "retries": task.get("retries", 0),
                 "last_error": task.get("last_error", None),
-                "url": task.get("url", None),
-                "title": task.get("title", "Unknown"),
-                "proxy_enabled": True
+                "url": task.get("url", None)
             })
         logger.warning(f"No download task found for {filename}")
         raise HTTPException(status_code=404, detail="No download task found")
@@ -1145,40 +850,15 @@ async def check_status(filename: str):
         logger.error(f"Status check error for {filename}: {e}")
         raise HTTPException(status_code=500, detail=f"Status check error: {str(e)}")
 
-# Health check endpoint with proxy info
+# Health check endpoint
 @app.get("/health")
 async def health_check():
     return JSONResponse({
         "status": "healthy",
         "active_downloads": len(ACTIVE_DOWNLOADS),
         "total_tasks": len(DOWNLOAD_TASKS),
-        "available_workers": MAX_WORKERS,
-        "instagram_support": "enhanced",
-        "proxy_enabled": True,
-        "proxy_host": f"{PROXY_HOST}:{PROXY_PORT}",
-        "proxy_user": PROXY_USERNAME
+        "available_workers": MAX_WORKERS
     })
-
-# **NEW: Proxy test endpoint**
-@app.get("/test-proxy")
-async def test_proxy():
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get("https://httpbin.org/ip", proxy=PROXY_URL, timeout=aiohttp.ClientTimeout(total=10)) as response:
-                data = await response.json()
-                return JSONResponse({
-                    "proxy_working": True,
-                    "proxy_ip": data.get("origin"),
-                    "proxy_host": f"{PROXY_HOST}:{PROXY_PORT}",
-                    "proxy_user": PROXY_USERNAME
-                })
-    except Exception as e:
-        return JSONResponse({
-            "proxy_working": False,
-            "error": str(e),
-            "proxy_host": f"{PROXY_HOST}:{PROXY_PORT}",
-            "proxy_user": PROXY_USERNAME
-        })
 
 if __name__ == "__main__":
     import uvicorn
