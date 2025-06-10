@@ -16,7 +16,7 @@ import base64
 import hashlib
 import instaloader
 from werkzeug.utils import secure_filename
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import urlparse, urlunparse, parse_qs
 import uuid
 import re
 from typing import Optional
@@ -37,7 +37,7 @@ BASE_DOMAIN = "https://yt.hosters.club"
 
 # High-performance configuration for 200k daily requests
 MAX_WORKERS = 200  # Increased for your 8-core/16GB setup
-MAX_CONCURRENT_DOWNLOADS = 500  # Parallel downloads
+MAX_CONCURRENT_DOWNLOADS = 50  # Parallel downloads
 DOWNLOAD_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 ACTIVE_DOWNLOADS = set()  # Track active downloads
 
@@ -102,12 +102,24 @@ def clean_youtube_url(url):
         logger.error(f"Failed to clean YouTube URL {url}: {e}")
         return url
 
-# Clean Instagram URL
+# **FIXED:** Enhanced Instagram URL cleaning - less aggressive, keeps essential parameters
 def clean_instagram_url(url):
     try:
         parsed = urlparse(url)
-        # Keep only scheme, netloc, and path (remove query parameters)
-        cleaned = urlunparse((parsed.scheme, parsed.netloc, parsed.path, '', '', ''))
+        
+        # Keep essential query parameters that Instagram might need
+        query_params = parse_qs(parsed.query)
+        essential_params = {}
+        
+        # Keep important parameters that might be needed for access
+        for param in ['igshid', 'utm_source', 'utm_medium']:
+            if param in query_params:
+                essential_params[param] = query_params[param][0]
+        
+        # Rebuild query string with essential parameters only
+        new_query = '&'.join([f"{k}={v}" for k, v in essential_params.items()]) if essential_params else ''
+        
+        cleaned = urlunparse((parsed.scheme, parsed.netloc, parsed.path, '', new_query, ''))
         return cleaned.rstrip('/')
     except Exception as e:
         logger.error(f"Failed to clean Instagram URL {url}: {e}")
@@ -215,27 +227,104 @@ async def download_file(url, path, retries=1):
                 await asyncio.sleep(1)
             return False
 
-# Instagram info extraction with retries
+# **FIXED:** Enhanced Instagram info extraction with better shortcode parsing
 async def get_instagram_video_info(post_url, retries=3, delay=1):
+    def extract_shortcode(url):
+        """Enhanced shortcode extraction that handles multiple URL formats"""
+        try:
+            # Clean URL first
+            parsed = urlparse(url)
+            path = parsed.path.strip('/')
+            
+            # Handle different Instagram URL patterns
+            patterns = [
+                r'/p/([A-Za-z0-9_-]+)',          # Posts: /p/ABC123/
+                r'/reel/([A-Za-z0-9_-]+)',       # Reels: /reel/ABC123/
+                r'/tv/([A-Za-z0-9_-]+)',         # IGTV: /tv/ABC123/
+                r'/([A-Za-z0-9_-]+)/?$'          # Direct shortcode
+            ]
+            
+            for pattern in patterns:
+                match = re.search(pattern, path)
+                if match:
+                    shortcode = match.group(1)
+                    logger.info(f"Extracted shortcode: {shortcode} from {url}")
+                    return shortcode
+            
+            # Fallback: split by slashes and find shortcode-like string
+            parts = [p for p in path.split('/') if p]
+            for part in parts:
+                if len(part) >= 8 and part.replace('_', '').replace('-', '').isalnum():
+                    logger.info(f"Fallback extracted shortcode: {part} from {url}")
+                    return part
+            
+            logger.error(f"Could not extract shortcode from {url}")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Shortcode extraction error for {url}: {e}")
+            return None
+    
     def sync_get_info():
         try:
-            L = instaloader.Instaloader()
-            L.context.user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            shortcode = post_url.split("/")[-2] if post_url.endswith("/") else post_url.split("/")[-1]
+            # Create instaloader instance with better settings
+            L = instaloader.Instaloader(
+                download_pictures=False,
+                download_videos=False, 
+                download_video_thumbnails=False,
+                save_metadata=False,
+                compress_json=False
+            )
+            
+            # Set user agent to avoid detection
+            L.context.user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            
+            shortcode = extract_shortcode(post_url)
+            if not shortcode:
+                logger.error(f"Failed to extract shortcode from {post_url}")
+                return None
+            
+            logger.info(f"Attempting to fetch Instagram post with shortcode: {shortcode}")
+            
+            # Get post info
             post = instaloader.Post.from_shortcode(L.context, shortcode)
-            return {
-                "video_url": post.video_url if post.is_video else None,
-                "title": (post.caption or f"Instagram_{shortcode}")[:100],
-                "thumbnail": post.url
+            
+            if not post.is_video:
+                logger.error(f"Instagram post {shortcode} is not a video")
+                return None
+            
+            video_url = post.video_url
+            if not video_url:
+                logger.error(f"No video URL found for Instagram post {shortcode}")
+                return None
+            
+            # Create a clean title
+            caption = post.caption or ""
+            title = caption[:100] if caption else f"Instagram_{shortcode}"
+            # Clean title for filename safety
+            title = re.sub(r'[^\w\s-]', '', title).strip()
+            if not title:
+                title = f"Instagram_{shortcode}"
+            
+            result = {
+                "video_url": video_url,
+                "title": title,
+                "thumbnail": post.url,
+                "shortcode": shortcode
             }
+            
+            logger.info(f"Successfully extracted Instagram info: {result['title']}")
+            return result
+            
         except Exception as e:
-            logger.error(f"Instagram info error: {e}")
+            logger.error(f"Instagram info extraction error: {e}")
             return None
     
     for attempt in range(1, retries + 1):
         try:
             result = await asyncio.get_event_loop().run_in_executor(executor, sync_get_info)
-            if result:
+            if result and result.get("video_url"):
+                logger.info(f"Instagram info extracted successfully on attempt {attempt}")
                 return result
             logger.warning(f"Failed to get Instagram info for {post_url} (Attempt {attempt}/{retries})")
             if attempt == retries:
@@ -248,15 +337,33 @@ async def get_instagram_video_info(post_url, retries=3, delay=1):
             await asyncio.sleep(delay)
     return None
 
-# Enhanced Instagram processing
+# **FIXED:** Enhanced Instagram video processing with better ffmpeg commands
 async def process_instagram_video(temp_path, output_path, sound=False, quality=None):
     if not check_ffmpeg():
         raise HTTPException(status_code=500, detail="ffmpeg not available")
     
     try:
+        # Ensure input file exists and has content
+        if not os.path.exists(temp_path) or os.path.getsize(temp_path) == 0:
+            logger.error(f"Input file doesn't exist or is empty: {temp_path}")
+            return False
+        
+        logger.info(f"Processing Instagram video: {temp_path} -> {output_path}")
+        
         if sound:
-            # Fixed MP3 command with proper audio codec
-            cmd = f'ffmpeg -i "{temp_path}" -vn -acodec libmp3lame -b:a 320k -ar 44100 -ac 2 "{output_path}" -y -loglevel error'
+            # Enhanced MP3 extraction with better error handling
+            cmd = [
+                'ffmpeg', '-i', temp_path,
+                '-vn',  # No video
+                '-acodec', 'libmp3lame',
+                '-b:a', '320k',
+                '-ar', '44100',
+                '-ac', '2',
+                '-y',  # Overwrite output file
+                '-loglevel', 'error',
+                '-hide_banner',
+                output_path
+            ]
         else:
             if quality:
                 resolution_map = {
@@ -264,21 +371,61 @@ async def process_instagram_video(temp_path, output_path, sound=False, quality=N
                     "360": "640:360", "240": "426:240"
                 }
                 res = resolution_map.get(quality, "1280:720")
-                cmd = f'ffmpeg -i "{temp_path}" -vf "scale={res}:force_original_aspect_ratio=decrease:force_divisible_by=2" -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 128k "{output_path}" -y -loglevel error'
+                cmd = [
+                    'ffmpeg', '-i', temp_path,
+                    '-vf', f'scale={res}:force_original_aspect_ratio=decrease:force_divisible_by=2',
+                    '-c:v', 'libx264',
+                    '-preset', 'fast',
+                    '-crf', '23',
+                    '-c:a', 'aac',
+                    '-b:a', '128k',
+                    '-movflags', '+faststart',  # Optimize for streaming
+                    '-y',  # Overwrite output file
+                    '-loglevel', 'error',
+                    '-hide_banner',
+                    output_path
+                ]
             else:
-                cmd = f'ffmpeg -i "{temp_path}" -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 128k "{output_path}" -y -loglevel error'
+                # Default processing - just re-encode for compatibility
+                cmd = [
+                    'ffmpeg', '-i', temp_path,
+                    '-c:v', 'libx264',
+                    '-preset', 'fast',
+                    '-crf', '23',
+                    '-c:a', 'aac',
+                    '-b:a', '128k',
+                    '-movflags', '+faststart',  # Optimize for streaming
+                    '-y',  # Overwrite output file
+                    '-loglevel', 'error',
+                    '-hide_banner',
+                    output_path
+                ]
         
-        process = await asyncio.create_subprocess_shell(
-            cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        # Run ffmpeg with better error handling
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
         )
-        stdout, stderr = await process.communicate()
+        
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=300)  # 5 minute timeout
         
         if process.returncode == 0:
-            logger.info(f"Processed Instagram video: {os.path.basename(output_path)}")
-            return True
+            # Verify output file was created and has content
+            if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                logger.info(f"Successfully processed Instagram video: {os.path.basename(output_path)}")
+                return True
+            else:
+                logger.error(f"Output file was not created or is empty: {output_path}")
+                return False
         else:
-            logger.error(f"ffmpeg failed: {stderr.decode()}")
+            error_msg = stderr.decode() if stderr else "Unknown ffmpeg error"
+            logger.error(f"ffmpeg failed with return code {process.returncode}: {error_msg}")
             return False
+            
+    except asyncio.TimeoutError:
+        logger.error(f"ffmpeg timeout processing {temp_path}")
+        return False
     except Exception as e:
         logger.error(f"Instagram processing error: {e}")
         return False
@@ -669,13 +816,18 @@ async def handle_spotify(url: str, request: Request):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Spotify error: {str(e)}")
 
-# BACKGROUND Instagram handler
+# **FIXED:** Enhanced Instagram handler with better error handling
 async def handle_instagram(url: str, request: Request, sound: bool = False, quality: str = None):
+    logger.info(f"Handling Instagram URL: {url}")
+    
     info = await get_instagram_video_info(url)
-    if not info or not info["video_url"]:
-        error_msg = f"Invalid Instagram URL or no video found: {url}"
+    if not info or not info.get("video_url"):
+        error_msg = f"Failed to extract Instagram video info. URL: {url}, Info: {info}"
         logger.error(error_msg)
-        raise HTTPException(status_code=400, detail=error_msg)
+        raise HTTPException(status_code=400, detail="Could not extract Instagram video information. Please check the URL and try again.")
+
+    video_url = info["video_url"]
+    logger.info(f"Instagram video URL extracted: {video_url}")
 
     output_filename = get_unique_filename(url, quality or "original", sound)
     output_path = os.path.join(DOWNLOAD_DIR, output_filename)
@@ -683,13 +835,13 @@ async def handle_instagram(url: str, request: Request, sound: bool = False, qual
     # Start BACKGROUND download
     if output_path not in ACTIVE_DOWNLOADS:
         ACTIVE_DOWNLOADS.add(output_path)
-        asyncio.create_task(background_instagram_download(info["video_url"], output_path, sound, quality))
+        asyncio.create_task(background_instagram_download(video_url, output_path, sound, quality))
 
     base_url = str(request.base_url).rstrip('/')
     return JSONResponse({
         "title": info["title"],
         "thumbnail": info["thumbnail"],
-        "link": info["video_url"],
+        "link": video_url,
         "stream_mp4": f"{base_url}/stream/{output_filename}" if not sound else None,
         "stream_mp3": f"{base_url}/stream/{output_filename}" if sound else None,
         "file_name": output_filename
@@ -719,8 +871,10 @@ async def background_download(url, file_path, retries=3, delay=1):
     finally:
         ACTIVE_DOWNLOADS.discard(file_path)
 
+# **FIXED:** Enhanced background Instagram download with better temp file handling
 async def background_instagram_download(video_url, output_path, sound, quality, retries=3, delay=1):
-    temp_filename = f"temp_{int(time.time())}_{os.getpid()}.mp4"
+    # Create unique temp filename to avoid conflicts
+    temp_filename = f"temp_instagram_{int(time.time())}_{os.getpid()}_{hashlib.md5(video_url.encode()).hexdigest()[:8]}.mp4"
     temp_path = os.path.join(DOWNLOAD_DIR, temp_filename)
     
     try:
@@ -728,26 +882,61 @@ async def background_instagram_download(video_url, output_path, sound, quality, 
         
         for attempt in range(1, retries + 1):
             try:
-                if await download_file(video_url, temp_path, retries=1):
+                logger.info(f"Instagram download attempt {attempt}/{retries} for {video_url}")
+                
+                # Download the raw video file
+                if await download_file(video_url, temp_path, retries=2):
+                    # Verify temp file exists and has content
+                    if not os.path.exists(temp_path) or os.path.getsize(temp_path) == 0:
+                        error_msg = f"Downloaded file is empty or missing: {temp_path}"
+                        logger.error(error_msg)
+                        DOWNLOAD_TASKS[output_path] = {"status": "downloading", "url": video_url, "retries": attempt, "last_error": error_msg}
+                        if attempt == retries:
+                            DOWNLOAD_TASKS[output_path] = {"status": "failed", "url": video_url, "retries": attempt, "last_error": error_msg}
+                            return
+                        continue
+                    
+                    logger.info(f"Downloaded Instagram video to temp file: {temp_path} ({os.path.getsize(temp_path)} bytes)")
+                    
+                    # Process the video with ffmpeg
                     if await process_instagram_video(temp_path, output_path, sound, quality):
-                        DOWNLOAD_TASKS[output_path] = {"status": "completed", "url": video_url, "retries": attempt - 1}
-                        logger.info(f"Completed Instagram download: {os.path.basename(output_path)}")
-                        return
+                        # Verify final output
+                        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                            DOWNLOAD_TASKS[output_path] = {"status": "completed", "url": video_url, "retries": attempt - 1}
+                            logger.info(f"Successfully completed Instagram download: {os.path.basename(output_path)} ({os.path.getsize(output_path)} bytes)")
+                            return
+                        else:
+                            error_msg = f"Final output file is empty or missing: {output_path}"
+                            logger.error(error_msg)
+                            DOWNLOAD_TASKS[output_path] = {"status": "downloading", "url": video_url, "retries": attempt, "last_error": error_msg}
+                            if attempt == retries:
+                                DOWNLOAD_TASKS[output_path] = {"status": "failed", "url": video_url, "retries": attempt, "last_error": error_msg}
+                                return
                     else:
-                        error_msg = f"Instagram processing failed for {video_url} (Attempt {attempt}/{retries})"
+                        error_msg = f"Instagram video processing failed for {video_url} (Attempt {attempt}/{retries})"
                         DOWNLOAD_TASKS[output_path] = {"status": "downloading", "url": video_url, "retries": attempt, "last_error": error_msg}
                         logger.error(error_msg)
                         if attempt == retries:
                             DOWNLOAD_TASKS[output_path] = {"status": "failed", "url": video_url, "retries": attempt, "last_error": error_msg}
                             return
                 else:
-                    error_msg = f"Instagram download failed for {video_url} (Attempt {attempt}/{retries})"
+                    error_msg = f"Instagram raw download failed for {video_url} (Attempt {attempt}/{retries})"
                     DOWNLOAD_TASKS[output_path] = {"status": "downloading", "url": video_url, "retries": attempt, "last_error": error_msg}
                     logger.error(error_msg)
                     if attempt == retries:
                         DOWNLOAD_TASKS[output_path] = {"status": "failed", "url": video_url, "retries": attempt, "last_error": error_msg}
                         return
+                
+                # Clean up temp file between attempts
+                if os.path.exists(temp_path):
+                    try:
+                        os.remove(temp_path)
+                        logger.info(f"Cleaned up temp file: {temp_path}")
+                    except Exception as cleanup_error:
+                        logger.warning(f"Failed to cleanup temp file {temp_path}: {cleanup_error}")
+                
                 await asyncio.sleep(delay)
+                
             except Exception as e:
                 error_msg = f"Instagram download error: {str(e)} (Attempt {attempt}/{retries})"
                 DOWNLOAD_TASKS[output_path] = {"status": "downloading", "url": video_url, "retries": attempt, "last_error": error_msg}
@@ -755,17 +944,21 @@ async def background_instagram_download(video_url, output_path, sound, quality, 
                 if attempt == retries:
                     DOWNLOAD_TASKS[output_path] = {"status": "failed", "url": video_url, "retries": attempt, "last_error": error_msg}
                     return
+                await asyncio.sleep(delay)
+                
     except Exception as e:
         error_msg = f"Critical Instagram download error: {str(e)}"
         DOWNLOAD_TASKS[output_path] = {"status": "failed", "url": video_url, "retries": retries, "last_error": error_msg}
         logger.error(error_msg)
     finally:
         ACTIVE_DOWNLOADS.discard(output_path)
+        # Always clean up temp file
         if os.path.exists(temp_path):
             try:
                 os.remove(temp_path)
-            except:
-                pass
+                logger.info(f"Final cleanup of temp file: {temp_path}")
+            except Exception as cleanup_error:
+                logger.warning(f"Failed to final cleanup temp file {temp_path}: {cleanup_error}")
 
 # Streaming endpoints with enhanced stability
 @app.get("/stream/{filename}")
