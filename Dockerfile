@@ -1,5 +1,5 @@
 # Use Ubuntu 20.04 as base image with systemd support
-FROM ubuntu:20.04
+FROM ubuntu:22.04
 
 # Install systemd and system dependencies
 RUN apt-get update && apt-get install -y \
